@@ -1,0 +1,4168 @@
+---
+title: "Effect of social interactions and genetic relatedness on house mouse microbiota"
+author: "Jakub Kreisinger"
+date: "November 8, 2021"
+output: html_document
+---
+
+```{r}
+set.seed(1234)
+
+library(phyloseq)
+library(ape)
+library(vegan)
+library(dplyr)
+library(stringr)
+library(brms)
+library(reshape2)
+library(plyr)
+library(ggplot2)
+library(ggh4x)
+library(lme4)
+library(lmerTest)
+library(ggeffects)
+library(gginnards)
+library(ggpubr)
+library(splines)
+library(lmerMultiMember)
+library(variancePartition)
+
+
+# custom PCoA function
+pcoa_my<-function (D, correction = "none", rn = NULL) 
+{
+  #new functions:
+   centre <- function(D, n) {
+    One <- matrix(1, n, n)
+    mat <- diag(n) - One/n
+    mat.cen <- mat %*% D %*% mat
+    mat.cen[lower.tri(mat.cen)] <- t(mat.cen)[lower.tri(mat.cen)]
+    return(mat.cen)
+  }
+  #original function:
+  # centre <- function(D, n) {
+  #   One <- matrix(1, n, n)
+  #   mat <- diag(n) - One/n
+  #   mat.cen <- mat %*% D %*% mat
+  # }
+  bstick.def <- function(n, tot.var = 1, ...) {
+    res <- rev(cumsum(tot.var/n:1)/n)
+    names(res) <- paste("Stick", seq(len = n), sep = "")
+    return(res)
+  }
+  D <- as.matrix(D)
+  n <- nrow(D)
+  epsilon <- sqrt(.Machine$double.eps)
+  if (length(rn) != 0) {
+    names <- rn
+  }
+  else {
+    names <- rownames(D)
+  }
+  CORRECTIONS <- c("none", "lingoes", "cailliez")
+  correct <- pmatch(correction, CORRECTIONS)
+  if (is.na(correct)) 
+    stop("Invalid correction method")
+  delta1 <- centre((-0.5 * D^2), n)
+  trace <- sum(diag(delta1))
+  D.eig <- eigen(delta1)
+  min.eig <- min(D.eig$values)
+  zero.eig <- which(abs(D.eig$values) < epsilon)
+  D.eig$values[zero.eig] <- 0
+  if (min.eig > -epsilon) {
+    correct <- 1
+    eig <- D.eig$values
+    k <- length(which(eig > epsilon))
+    rel.eig <- eig[1:k]/trace
+    cum.eig <- cumsum(rel.eig)
+    vectors <- sweep(D.eig$vectors[, 1:k, drop = FALSE], 
+                     2, sqrt(eig[1:k]), FUN = "*")
+    bs <- bstick.def(k)
+    cum.bs <- cumsum(bs)
+    res <- data.frame(eig[1:k], rel.eig, bs, cum.eig, cum.bs)
+    colnames(res) <- c("Eigenvalues", "Relative_eig", "Broken_stick", 
+                       "Cumul_eig", "Cumul_br_stick")
+    rownames(res) <- 1:nrow(res)
+    rownames(vectors) <- names
+    colnames(vectors) <- colnames(vectors, do.NULL = FALSE, 
+                                  prefix = "Axis.")
+    note <- paste("There were no negative eigenvalues. No correction was applied")
+    out <- (list(correction = c(correction, correct), note = note, 
+                 values = res, vectors = vectors, trace = trace))
+  }
+  else {
+    k <- n
+    eig <- D.eig$values
+    rel.eig <- eig/trace
+    rel.eig.cor <- (eig - min.eig)/(trace - (n - 1) * min.eig)
+    if (length(zero.eig)) 
+      rel.eig.cor <- c(rel.eig.cor[-zero.eig[1]], 0)
+    cum.eig.cor <- cumsum(rel.eig.cor)
+    k2 <- length(which(eig > epsilon))
+    k3 <- length(which(rel.eig.cor > epsilon))
+    vectors <- sweep(D.eig$vectors[, 1:k2, drop = FALSE], 
+                     2, sqrt(eig[1:k2]), FUN = "*")
+    if ((correct == 2) | (correct == 3)) {
+      if (correct == 2) {
+        c1 <- -min.eig
+        note <- paste("Lingoes correction applied to negative eigenvalues: D' = -0.5*D^2 -", 
+                      c1, ", except diagonal elements")
+        D <- -0.5 * (D^2 + 2 * c1)
+      }
+      else if (correct == 3) {
+        delta2 <- centre((-0.5 * D), n)
+        upper <- cbind(matrix(0, n, n), 2 * delta1)
+        lower <- cbind(-diag(n), -4 * delta2)
+        sp.matrix <- rbind(upper, lower)
+        c2 <- max(Re(eigen(sp.matrix, symmetric = FALSE, 
+                           only.values = TRUE)$values))
+        note <- paste("Cailliez correction applied to negative eigenvalues: D' = -0.5*(D +", 
+                      c2, ")^2, except diagonal elements")
+        D <- -0.5 * (D + c2)^2
+      }
+      diag(D) <- 0
+      mat.cor <- centre(D, n)
+      toto.cor <- eigen(mat.cor)
+      trace.cor <- sum(diag(mat.cor))
+      min.eig.cor <- min(toto.cor$values)
+      zero.eig.cor <- which((toto.cor$values < epsilon) & 
+                              (toto.cor$values > -epsilon))
+      toto.cor$values[zero.eig.cor] <- 0
+      if (min.eig.cor > -epsilon) {
+        eig.cor <- toto.cor$values
+        rel.eig.cor <- eig.cor[1:k]/trace.cor
+        cum.eig.cor <- cumsum(rel.eig.cor)
+        k2 <- length(which(eig.cor > epsilon))
+        vectors.cor <- sweep(toto.cor$vectors[, 1:k2, 
+                                              drop = FALSE], 2, sqrt(eig.cor[1:k2]), FUN = "*")
+        rownames(vectors.cor) <- names
+        colnames(vectors.cor) <- colnames(vectors.cor, 
+                                          do.NULL = FALSE, prefix = "Axis.")
+        bs <- bstick.def(k2)
+        bs <- c(bs, rep(0, (k - k2)))
+        cum.bs <- cumsum(bs)
+      }
+      else {
+        if (correct == 2) 
+          cat("Problem! Negative eigenvalues are still present after Lingoes", 
+              "\n")
+        if (correct == 3) 
+          cat("Problem! Negative eigenvalues are still present after Cailliez", 
+              "\n")
+        rel.eig.cor <- cum.eig.cor <- bs <- cum.bs <- rep(NA, 
+                                                          n)
+        vectors.cor <- matrix(NA, n, 2)
+        rownames(vectors.cor) <- names
+        colnames(vectors.cor) <- colnames(vectors.cor, 
+                                          do.NULL = FALSE, prefix = "Axis.")
+      }
+      res <- data.frame(eig[1:k], eig.cor[1:k], rel.eig.cor, 
+                        bs, cum.eig.cor, cum.bs)
+      colnames(res) <- c("Eigenvalues", "Corr_eig", "Rel_corr_eig", 
+                         "Broken_stick", "Cum_corr_eig", "Cum_br_stick")
+      rownames(res) <- 1:nrow(res)
+      rownames(vectors) <- names
+      colnames(vectors) <- colnames(vectors, do.NULL = FALSE, 
+                                    prefix = "Axis.")
+      out <- (list(correction = c(correction, correct), 
+                   note = note, values = res, vectors = vectors, 
+                   trace = trace, vectors.cor = vectors.cor, trace.cor = trace.cor))
+    }
+    else {
+      note <- "No correction was applied to the negative eigenvalues"
+      bs <- bstick.def(k3)
+      bs <- c(bs, rep(0, (k - k3)))
+      cum.bs <- cumsum(bs)
+      res <- data.frame(eig[1:k], rel.eig, rel.eig.cor, 
+                        bs, cum.eig.cor, cum.bs)
+      colnames(res) <- c("Eigenvalues", "Relative_eig", 
+                         "Rel_corr_eig", "Broken_stick", "Cum_corr_eig", 
+                         "Cumul_br_stick")
+      rownames(res) <- 1:nrow(res)
+      rownames(vectors) <- names
+      colnames(vectors) <- colnames(vectors, do.NULL = FALSE, 
+                                    prefix = "Axis.")
+      out <- (list(correction = c(correction, correct), 
+                   note = note, values = res, vectors = vectors, 
+                   trace = trace))
+    }
+  }
+  class(out) <- "pcoa"
+  out
+}
+
+
+
+#function adjusting the style of plots
+small_fig<-function(x){
+  x+theme(axis.title = element_text(size=8),
+          axis.text = element_text(size=8),
+          legend.title = element_text(size=8),
+          legend.text = element_text(size=8),
+          plot.title = element_text(size=8))
+}
+
+#function cleaning NAs in phyloseq tax_table
+manage_unassigned<-function(PHYLOSEQ,UNASS_STRING=NA,ADD,AFTER=TRUE){
+   TAXall<-data.frame(tax_table(PHYLOSEQ),stringsAsFactors = F)
+   if(!is.na(UNASS_STRING)){TAXall[UNASS_STRING]<-NA}
+   # TAXall<-as.character(TAXall[i,])
+   for(i in 1:dim(TAXall)[1]){  
+       TAX<-as.character(TAXall[i,])
+       if(AFTER==TRUE) {for(j in 2: length(TAX)){
+                            if(is.na(TAX[j])){TAX[j]<-ifelse(regexpr(ADD,TAX[j-1])>0,
+                                           TAX[j-1],paste(TAX[j-1],ADD,sep=""))}}}
+      if(AFTER==FALSE) {for(j in 2: length(TAX)){
+                            if(is.na(TAX[j])){TAX[j]<-ifelse(regexpr(ADD,TAX[j-1])>0,
+                                     TAX[j-1],ADD,paste(TAX[j-1],sep=""))}}}
+      TAXall[i,]<-TAX
+    }
+   TAXA<-colnames(TAXall)
+   SPECIES<-rownames(TAXall)
+   TAXall<-tax_table(TAXall)
+   taxa_names(TAXall)<-SPECIES
+   colnames(TAXall)<-TAXA
+   tax_table(PHYLOSEQ)<-TAXall
+ 
+   #output
+   PHYLOSEQ
+}
+
+
+#function preparing data.frame for taxplots from phyloseq object 
+prepare_tax_df<-function(PHYLOSEQ,RANK,Unass.symbol=NA,Unass.repl,
+                         min_prop,top_tax,bellow_top,
+                         merge_categories,prop.trans,sort_abu){
+if(prop.trans==T){PHYLOSEQ=transform_sample_counts(PHYLOSEQ,function(x) x/sum(x))}
+TT<-tax_table(PHYLOSEQ)
+class(TT)<-"matrix"
+TT[is.na(tax_table(TT))]<-Unass.repl
+TT<-tax_table(TT)
+tax_table(PHYLOSEQ)<-TT
+
+PHYLOSEQ.merged<-tax_glom(PHYLOSEQ,taxrank=RANK)
+PHYLOSEQ.merged=transform_sample_counts(PHYLOSEQ.merged,function(x) x/sum(x))
+
+#select top taxa
+NAMES<-as.character(tax_table(PHYLOSEQ.merged)[,RANK])
+TS<-taxa_sums(PHYLOSEQ.merged)
+names(TS)<-NAMES
+TS<-rev(sort(TS))
+KEEP<-names(TS)[1:top_tax]
+
+#
+TT<-tax_table(PHYLOSEQ.merged)
+class(TT)<-"matrix"
+TT[,RANK][!TT[,RANK]%in%KEEP]<-bellow_top
+TT<-tax_table(TT)
+tax_table(PHYLOSEQ.merged)<-TT
+PHYLOSEQ.merged<-tax_glom(PHYLOSEQ.merged,taxrank=RANK)
+
+mdf = psmelt(PHYLOSEQ.merged)
+
+if(sort_abu==T){
+  mdf[,RANK]<-as.factor(mdf[,RANK])
+  ADD<-levels(mdf[,RANK])[!levels(mdf[,RANK])%in%KEEP]
+  if(length(ADD)>0){mdf[,RANK]<-factor(mdf[,RANK],levels=c(KEEP,ADD))}
+  if(length(ADD)==0){mdf[,RANK]<-factor(mdf[,RANK],levels=c(KEEP))}
+}
+
+mdf
+}
+
+
+```
+
+# Loading phyloseq object
+
+```{r}
+load("~/data/Areny_social/PHYLOSEQ_revision/ARENY1618.NEW.R")
+ARENY1618<-ARENY1618.NEW.50
+taxa_names(ARENY1618)<-paste("OTU",1:ntaxa(ARENY1618),sep="_")
+sample_data(ARENY1618)$gut_section<-as.factor(sample_data(ARENY1618)$gut_section)
+sample_data(ARENY1618)$gut_section<-factor(sample_data(ARENY1618)$gut_section,
+                                                  levels=c("Ileum","Caecum","Colon"))
+
+
+```
+
+
+
+
+#Summary statistics
+
+Total number of reads, sequencing depth, number of samples analysed etc.
+
+```{r}
+
+sum(otu_table(ARENY1618))
+summary(sample_sums(ARENY1618))
+
+SD<-data.frame(sample_data(ARENY1618))
+# names(SD)
+SD$sex<-as.factor(SD$sex)
+levels(SD$sex)[2]<-"F"
+
+tapply(SD$gut_section,list(SD$gut_section,SD$subspecies_zkr),length)
+tapply(SD$gut_section,list(SD$gut_section,SD$subspecies_zkr,SD$sex),length)
+
+SD$SN<-toupper(sapply(strsplit(sample_names(ARENY1618), "_"), function(x) x[1], simplify=T))
+
+TO_MELT<-data.frame(SN=SD$SN,
+                    GS=SD$gut_section,
+                    Spec=SD$subspecies_zkr)
+
+TO_MELT.l<-dcast(TO_MELT, SN ~ GS)
+```
+
+
+# Microbiota overview
+
+Figure S1 - alpha diverity, beta diversity and taxonomic composition in three gut sections (colon, caecum, ileum) and two house mouse subsepcies (MMM, MMD) 
+```{r}
+tax_table(ARENY1618)[,"Genus"]<-gsub("_unass.","",tax_table(ARENY1618)[,"Genus"])
+tax_table(ARENY1618)[,"Genus"]<-gsub("_group","",tax_table(ARENY1618)[,"Genus"])
+tax_table(ARENY1618)[,"Class"]<-gsub("_unass.","",tax_table(ARENY1618)[,"Class"])
+###Alpha diversity
+ARENY1618.rare<-rarefy_even_depth(ARENY1618)
+RICH<-estimate_richness(ARENY1618.rare,measures = c("Observed","Shannon"))
+RICH<-data.frame(RICH,sample_data(ARENY1618))
+
+GG.alpha<-
+ggplot(RICH,aes(y=Shannon,x=gut_section,color=subspecies_zkr,fill=subspecies_zkr))+
+  geom_violin(alpha=0.1,draw_quantiles = 0.5)+
+  geom_point(position = position_jitterdodge(),alpha=0.5)
+
+GG.alpha<-GG.alpha+theme(axis.title.x = element_blank())
+#############ORDINATION
+BC<-vegdist(otu_table(ARENY1618.rare)^0.5)
+ord<-ordinate(ARENY1618,BC,method = "PCoA")
+ord.plot<-plot_ordination(ARENY1618,ord,shape="gut_section",color="subspecies_zkr")  
+ord.plot.df<-plot_ordination(ARENY1618,ord,shape="gut_section",color="subspecies_zkr",justDF = T)  
+names(ord.plot.df)
+
+TAPx<-tapply(ord.plot.df$Axis.1,list(ord.plot.df$subspecies_zkr,ord.plot.df$gut_section),mean)
+TAPx.l<-melt(TAPx)
+names(TAPx.l)[3]<-"MEAN.x"
+
+TAPy<-tapply(ord.plot.df$Axis.2,list(ord.plot.df$subspecies_zkr,ord.plot.df$gut_section),mean)
+TAPy.l<-melt(TAPy)
+names(TAPy.l)[3]<-"MEAN.y"
+
+TAPxy.l<-TAPx.l
+TAPxy.l$MEAN.y<-TAPy.l$MEAN.y
+TAPxy.l$Var1.2<-paste(TAPxy.l$Var1,TAPxy.l$Var2,sep="_")
+
+ord.plot.df$Var1.2<-paste(ord.plot.df$subspecies_zkr,
+                          ord.plot.df$gut_section,sep="_")
+ord.plot.df<-join(ord.plot.df,TAPxy.l)
+
+ord.plot$layers[[1]]<-NULL
+
+GG_beta<-
+  ord.plot+geom_point(data=ord.plot.df,aes(x=Axis.1,y=Axis.2,shape=gut_section,color=subspecies_zkr),
+                      size=1,alpha=0.5)+
+  geom_segment(data=ord.plot.df,
+                      aes(x=MEAN.x,xend =Axis.1 ,y=MEAN.y, yend = Axis.2),
+                      arrow = arrow(length = unit(0.0,"cm")),alpha=0.1)
+GG_beta<-GG_beta+theme(legend.position="bottom", legend.box="vertical", legend.margin=margin())
+
+######Taxonomy#####
+library(Polychrome)
+P25<-createPalette(25,c("#010101","#ff0000"),M=1000)
+P6<-createPalette(6,c("#010101","#ff0000"),M=1000)
+names(P25)<-NULL
+names(P6)<-NULL
+
+ARENY1618.trans<-transform_sample_counts(ARENY1618,function(x) x/sum(x))
+ARENY1618.trans.f<-manage_unassigned(PHYLOSEQ=ARENY1618.trans,
+                                     UNASS_STRING=NA,
+                                     ADD="",
+                                     AFTER=TRUE)
+
+DF.tax.class<-prepare_tax_df(PHYLOSEQ = ARENY1618.trans.f,
+                       RANK="Class",Unass.symbol = NA,Unass.repl = "Unassigned",
+                       min_prop = NULL,top_tax = 5,
+                       bellow_top = "Others",merge_categories = NULL,
+                       prop.trans = TRUE,sort_abu = T)
+
+DF.tax.genus<-prepare_tax_df(PHYLOSEQ = ARENY1618.trans.f,
+                       RANK="Genus",Unass.symbol = NA,Unass.repl = "Unassigned",
+                       min_prop = NULL,top_tax = 20,
+                       bellow_top = "Others",merge_categories = NULL,
+                       prop.trans = TRUE,sort_abu = T)
+levels(DF.tax.genus$Genus)[levels(DF.tax.genus$Genus)=="Candidatus_Arthromitus"]<-"Candidatus_Savagella"
+
+ta3 = ggplot(DF.tax.class, aes(x = mouse_name, y = Abundance, fill = Class,order=Class))+theme_bw(base_size = 12)
+ta3 = ta3 + geom_bar(stat = "identity", position = "stack")
+ta3= ta3 + theme(axis.title.x=element_blank(),axis.text.x = element_text(size = 7, angle = 90),axis.text.y = element_text(hjust = 0,size=10))
+ta3 <- ta3 + facet_nested(gut_section~subspecies_zkr, scales = "free",space="free")+
+  theme(strip.text = element_text(size = 10, angle = 0))+
+  scale_fill_manual(values = P25)
+gg.class<-ta3
+
+ta3 = ggplot(DF.tax.genus, aes(x = mouse_name, y = Abundance, fill = Genus,order=Genus))+theme_bw(base_size = 12)
+ta3 = ta3 + geom_bar(stat = "identity", position = "stack")
+ta3= ta3 + theme(axis.title.x=element_blank(),axis.text.x = element_text(size = 7, angle = 90),axis.text.y = element_text(hjust = 0,size=10))
+ta3 <- ta3 + facet_nested(gut_section~subspecies_zkr, scales = "free",space="free")+
+  theme(strip.text = element_text(size = 10, angle = 0))+
+  scale_fill_manual(values = P25)
+gg.genus<-ta3
+
+
+###################
+###################
+
+GG_beta.s<-small_fig(GG_beta+theme_bw())
+GG_beta.s<-GG_beta.s+theme(legend.title = element_blank(),
+                           legend.position = "bottom")+
+  theme(legend.direction = "horizontal", 
+        legend.position = "bottom",
+        legend.box = "horizontal"
+        )
+GG_beta.s<-GG_beta.s+theme(legend.position="bottom", legend.box="vertical", legend.margin=margin())
+
+GG.alpha.s<-small_fig(GG.alpha+theme_bw())+theme(axis.title.x = element_blank())
+GG.alpha.s<-GG.alpha.s+theme(legend.title = element_blank(),
+                           legend.position = "bottom")
+
+
+gg.class.s<-small_fig(gg.class)
+gg.genus.s<-small_fig(gg.genus)
+gg.genus.s<-
+gg.genus.s+theme(legend.title = element_blank(),
+                 legend.position = "bottom",
+                 strip.text = element_text(size=8),
+                 axis.text.x = element_blank(),
+                 axis.text.y = element_text(size=8),
+                 legend.key.size = unit(0.3,"line"))+
+  guides(fill=guide_legend(ncol=2))
+
+GRID1<-
+ggarrange(GG.alpha.s+ggtitle("A) Alpha diversity"),
+          GG_beta.s+ggtitle("B) Beta diversity"),
+          nrow = 2)
+
+GRID2<-ggarrange(GRID1,
+                 gg.genus.s+ggtitle("C) Dominant genera"),
+                 ncol = 2)
+
+ggsave(GRID2,filename = "~/data/Areny_social/RESULTS_revision/MMM_MMD_summary.pdf",
+       width = 18, height = 18, units="cm")
+
+
+GRID2
+```
+
+## Subsets for each gut section and subsepcies
+
+```{r}
+
+#######################################################
+######    SUBSETS - GUT SECTIONS, SUBSPECIES     ######
+#######################################################
+
+# subset pro MMM
+ARENY1618_M<-subset_samples(ARENY1618,subspecies_zkr=="MMM")
+#ARENY1618_M<-prune_taxa(taxa_sums(ARENY1618_M)>0,ARENY1618_M)
+# subset pro MMD
+ARENY1618_D<-subset_samples(ARENY1618,subspecies_zkr=="MMD")
+#ARENY1618_D<-prune_taxa(taxa_sums(ARENY1618_D)>0,ARENY1618_D)
+############################################################################
+# subset pro ILEUM_MMD
+ARENY1618_IL_D<-subset_samples(ARENY1618_D, gut_section=="Ileum")
+#ARENY1618_IL_D<-prune_taxa(taxa_sums(ARENY1618_IL_D)>0,ARENY1618_IL_D)
+# subset pro ILEUM_MMM
+ARENY1618_IL_M<-subset_samples(ARENY1618_M, gut_section=="Ileum")
+#ARENY1618_IL_M<-prune_taxa(taxa_sums(ARENY1618_IL_M)>0,ARENY1618_IL_M)
+########################################
+# subset pro CAECUM_MMD
+ARENY1618_CA_D<-subset_samples(ARENY1618_D, gut_section=="Caecum")
+#ARENY1618_CA_D<-prune_taxa(taxa_sums(ARENY1618_CA_D)>0,ARENY1618_CA_D)
+# subset pro CAECUM_MMM
+ARENY1618_CA_M<-subset_samples(ARENY1618_M, gut_section=="Caecum")
+#ARENY1618_CA_M<-prune_taxa(taxa_sums(ARENY1618_CA_M)>0,ARENY1618_CA_M)
+########################################
+# subset pro COLON_MMD
+ARENY1618_CO_D<-subset_samples(ARENY1618_D, gut_section=="Colon")
+#ARENY1618_CO_D<-prune_taxa(taxa_sums(ARENY1618_CO_D)>0,ARENY1618_CO_D)
+# subset pro COLON_MMM
+ARENY1618_CO_M<-subset_samples(ARENY1618_M, gut_section=="Colon")
+#ARENY1618_CO_M<-prune_taxa(taxa_sums(ARENY1618_CO_M)>0,ARENY1618_CO_M)
+
+sample_names(ARENY1618_CO_M)<-toupper(sapply(strsplit(sample_names(ARENY1618_CO_M), "_"), function(x) x[1], simplify=T))
+sample_names(ARENY1618_CA_M)<-toupper(sapply(strsplit(sample_names(ARENY1618_CA_M), "_"), function(x) x[1], simplify=T))
+sample_names(ARENY1618_IL_M)<-toupper(sapply(strsplit(sample_names(ARENY1618_IL_M), "_"), function(x) x[1], simplify=T))
+
+sample_names(ARENY1618_CO_D)<-toupper(sapply(strsplit(sample_names(ARENY1618_CO_D), "_"), function(x) x[1], simplify=T))
+sample_names(ARENY1618_CA_D)<-toupper(sapply(strsplit(sample_names(ARENY1618_CA_D), "_"), function(x) x[1], simplify=T))
+sample_names(ARENY1618_IL_D)<-toupper(sapply(strsplit(sample_names(ARENY1618_IL_D), "_"), function(x) x[1], simplify=T))
+
+
+```
+
+# Matrices with intensities of social interactions
+
+In this section, matrices describing social interactions are loaded and converted from wide to long format.
+
+```{r}
+SOC_matrixD <- read.csv("~/data/Areny_social/prilohy_333363/socnetwork_dom_2014.txt", sep = "\t")
+SOC_matrixM <- read.csv("~/data/Areny_social/prilohy_333363/socnetwork_mus_2014.txt", sep = "\t")
+
+
+SOC_distD.d<-as.dist(SOC_matrixD)
+SOC_distM.d<-as.dist(SOC_matrixM)
+
+SOC_matrixD.l<-reshape2::melt(as.matrix(SOC_matrixD))
+SOC_matrixM.l<-reshape2::melt(as.matrix(SOC_matrixM))
+
+names(SOC_matrixD.l)[3]<-names(SOC_matrixM.l)[3]<-"Social_dist"
+SOC_matrixD.l$Var1<-toupper(SOC_matrixD.l$Var1)
+SOC_matrixD.l$Var2<-toupper(SOC_matrixD.l$Var2)
+SOC_matrixM.l$Var1<-toupper(SOC_matrixM.l$Var1)
+SOC_matrixM.l$Var2<-toupper(SOC_matrixM.l$Var2)
+
+SOC_matrixD.l$JN<-paste(SOC_matrixD.l$Var1,SOC_matrixD.l$Var2,sep="_")
+SOC_matrixM.l$JN<-paste(SOC_matrixM.l$Var1,SOC_matrixM.l$Var2,sep="_")
+SOC_matrixD.l$Species<-"MMD"
+SOC_matrixM.l$Species<-"MMM"
+SOC_matrixDM.l<-rbind(SOC_matrixD.l,SOC_matrixM.l)
+
+SOC_matrixDM.l<-SOC_matrixDM.l[SOC_matrixDM.l$Var1!=SOC_matrixDM.l$Var2,]
+# SOC_matrixDM.l
+
+```
+
+# Matrices with values of genetic relatedness
+
+In this section, matrices with values of genetic relatedness are loaded and converted from wide to long format.
+
+```{r}
+
+load("~/data/Areny_social/genealogy/mmd_matrix.R")
+load("~/data/Areny_social/genealogy/mmm_matrix.R")
+
+rownames(mmd_matrix)<-colnames(mmd_matrix)<-toupper(colnames(mmd_matrix))
+rownames(mmm_matrix)<-colnames(mmm_matrix)<-toupper(colnames(mmm_matrix))
+
+GEN_matrixD.l<-reshape2::melt(as.matrix(mmd_matrix))
+GEN_matrixM.l<-reshape2::melt(as.matrix(mmm_matrix))
+
+names(GEN_matrixD.l)[3]<-names(GEN_matrixM.l)[3]<-"Genetic_dist"
+GEN_matrixD.l$Var1<-toupper(GEN_matrixD.l$Var1)
+GEN_matrixD.l$Var2<-toupper(GEN_matrixD.l$Var2)
+GEN_matrixM.l$Var1<-toupper(GEN_matrixM.l$Var1)
+GEN_matrixM.l$Var2<-toupper(GEN_matrixM.l$Var2)
+
+GEN_matrixD.l$JN<-paste(GEN_matrixD.l$Var1,GEN_matrixD.l$Var2,sep="_")
+GEN_matrixM.l$JN<-paste(GEN_matrixM.l$Var1,GEN_matrixM.l$Var2,sep="_")
+GEN_matrixD.l$Species<-"MMD"
+GEN_matrixM.l$Species<-"MMM"
+GEN_matrixDM.l<-rbind(GEN_matrixD.l,GEN_matrixM.l)
+
+GEN_matrixDM.l<-GEN_matrixDM.l[GEN_matrixDM.l$Var1!=GEN_matrixDM.l$Var2,]
+```
+
+**The information on genetic relatedness and the intensity of social interactions is summarised in a single data frame**
+
+```{r}
+
+ALL_l<-join(SOC_matrixDM.l,GEN_matrixDM.l[,3:4],by="JN")
+```
+
+# Microbiota similarities
+
+For colon, caecum and ileum, the PREPARE_DIST() function prepares a data.frame with Bray-Curtis and Jaccard similarities in a long format. The resulting data.frames are then merged with the data on generic relatedness and social interactions
+```{r}
+ARENY1618_IL<-subset_samples(ARENY1618, gut_section=="Ileum")
+ARENY1618_CA<-subset_samples(ARENY1618, gut_section=="Caecum")
+ARENY1618_CO<-subset_samples(ARENY1618, gut_section=="Colon")
+
+sample_names(ARENY1618_IL)<-toupper(sapply(strsplit(sample_names(ARENY1618_IL), "_"), 
+                        function(x) x[1], simplify=T))
+sample_names(ARENY1618_CA)<-toupper(sapply(strsplit(sample_names(ARENY1618_CA), "_"), 
+                        function(x) x[1], simplify=T))
+sample_names(ARENY1618_CO)<-toupper(sapply(strsplit(sample_names(ARENY1618_CO), "_"), 
+                        function(x) x[1], simplify=T))
+
+
+PREPARE_DIST<-function(x){
+  
+  x.trans<-transform_sample_counts(x,function(z) z/sum(z))
+  x.rare<-rarefy_even_depth(x)
+  
+  x.bc<-as.matrix(1-vegdist(otu_table(x.trans)^0.5))
+  x.ja<-as.matrix(1-vegdist(data.frame(otu_table(x.rare)),method="jaccard",binary=T))
+
+  x.bc.l<-melt(x.bc)
+  x.ja.l<-melt(x.ja)
+
+  x.bc.l$JN<-paste(x.bc.l$Var1,x.bc.l$Var2,sep="_")
+  x.ja.l$JN<-paste(x.ja.l$Var1,x.ja.l$Var2,sep="_")
+  
+  #pridat sample data
+  SD<-data.frame(sample_data(x))
+  SD1<-SD2<-SD
+  names(SD1)<-paste0(names(SD1),"_Var1")
+  names(SD2)<-paste0(names(SD2),"_Var2")
+  
+  SD1$Var1<-sample_names(x)
+  SD2$Var2<-sample_names(x)
+  
+  x.bc.l<-join(x.bc.l,SD1)
+  x.bc.l<-join(x.bc.l,SD2)
+  
+  x.ja.l<-join(x.ja.l,SD1)
+  x.ja.l<-join(x.ja.l,SD2)
+  
+  LIST<-list(x.bc.l,x.ja.l)
+  names(LIST)<-c("Jaccard","Bray")
+  LIST
+}
+
+CA<-PREPARE_DIST(ARENY1618_CA)
+CO<-PREPARE_DIST(ARENY1618_CO)
+IL<-PREPARE_DIST(ARENY1618_IL)
+
+CA.Bray<-CA$Bray
+CA.Jaccard<-CA$Jaccard
+CO.Jaccard<-CO$Jaccard
+CO.Bray<-CO$Bray
+IL.Jaccard<-IL$Jaccard
+IL.Bray<-IL$Bray
+
+CA.Jaccard.fin<-join(CA.Jaccard,ALL_l[,3:6],by="JN")
+CA.Bray.fin<-join(CA.Bray,ALL_l[,3:6],by="JN")
+CO.Jaccard.fin<-join(CO.Jaccard,ALL_l[,3:6],by="JN")
+CO.Bray.fin<-join(CO.Bray,ALL_l[,3:6],by="JN")
+IL.Jaccard.fin<-join(IL.Jaccard,ALL_l[,3:6],by="JN")
+IL.Bray.fin<-join(IL.Bray,ALL_l[,3:6],by="JN")
+
+#vyhodit mezidruhove similarity v mikrobiote
+CA.Jaccard.fin<-CA.Jaccard.fin[!is.na(CA.Jaccard.fin$Species),]
+CO.Jaccard.fin<-CO.Jaccard.fin[!is.na(CO.Jaccard.fin$Species),]
+IL.Jaccard.fin<-IL.Jaccard.fin[!is.na(IL.Jaccard.fin$Species),]
+CA.Bray.fin<-CA.Bray.fin[!is.na(CA.Bray.fin$Species),]
+CO.Bray.fin<-CO.Bray.fin[!is.na(CO.Bray.fin$Species),]
+IL.Bray.fin<-IL.Bray.fin[!is.na(IL.Bray.fin$Species),]
+
+DF.LIST2<-list(CA.Jaccard.fin,
+               CO.Jaccard.fin,
+               IL.Jaccard.fin,
+               CA.Bray.fin,
+               CO.Bray.fin,
+               IL.Bray.fin)
+
+names(DF.LIST2)<-c('CA.Jaccard.fin',
+               'CO.Jaccard.fin',
+               'IL.Jaccard.fin',
+               'CA.Bray.fin',
+               'CO.Bray.fin',
+               'IL.Bray.fin')
+
+
+```
+
+
+# Mixed models
+The effects of social interactions, genetic relatedness, subspecies identity and their interactions were tested using a mixed model in which the identity of the two individuals associated with a given dissimilarity value was considered as a random multimembership effect. Models were fitted separately for each gut section.
+
+```{r}
+##############################
+#BRAY-CURTIS##################
+##############################
+
+######Caecum#############
+DATA<-CA.Bray.fin
+FILT<-!is.na(DATA$Genetic_dist)&!is.na(DATA$Social_dist)
+DATA<-DATA[FILT,]
+DATA$Social_dist.sq<-DATA$Social_dist^0.5
+DATA$Genetic_dist.sq<-DATA$Genetic_dist^0.5
+DATA$value.logit<-car::logit(DATA$value)
+VECT<-paste(DATA$Var1,DATA$Var2,sep=",")
+MAT<-lmerMultiMember::weights_from_vector(VECT)
+
+
+m.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+Species+
+              Social_dist.sq:Species+Genetic_dist.sq:Species+
+               (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+# Social_dist.sq:Species+
+m.1<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+Species+
+              Genetic_dist.sq:Species+
+               (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+#Genetic_dist.sq:Species+
+m.2<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+Species+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+#Species+
+m.3<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+#Genetic
+m.4<-lmer(value.logit ~ Social_dist.sq+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+#Social_dist.sq+
+m.5<-lmer(value.logit ~ Genetic_dist.sq+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+A.1<-anova(m.0,m.1)
+A.2<-anova(m.2,m.1)
+A.3<-anova(m.2,m.3)
+A.4<-anova(m.4,m.3)
+A.5<-anova(m.3,m.5)
+
+R.rand<-MuMIn::r.squaredGLMM(m.3)[2]
+R.SG<-MuMIn::r.squaredGLMM(m.3)[1]
+R.S<-MuMIn::r.squaredGLMM(m.4)[1]
+R.G<-MuMIn::r.squaredGLMM(m.5)[1]
+
+Predictor<-c("Subspecies x Social","Subspecies x Genetic","Subspecies","Genetic","Social" )
+DF.LR<-data.frame(Predictor,
+                  rbind(A.1[2,],A.2[2,],A.3[2,],A.4[2,],A.5[2,]))
+INTERSECT<-R.S+R.G-R.SG
+R2<-c(R.rand,INTERSECT,R.S-INTERSECT,R.G-INTERSECT)
+names(R2)<-c("individual","both","social","genetic")
+
+##########
+DF.LR.CA_BC<-DF.LR
+R2_CA_BC<-R2
+
+######COLON#############
+DATA<-CO.Bray.fin
+FILT<-!is.na(DATA$Genetic_dist)&!is.na(DATA$Social_dist)
+DATA<-DATA[FILT,]
+DATA$Social_dist.sq<-DATA$Social_dist^0.5
+DATA$Genetic_dist.sq<-DATA$Genetic_dist^0.5
+DATA$value.logit<-car::logit(DATA$value)
+VECT<-paste(DATA$Var1,DATA$Var2,sep=",")
+MAT<-lmerMultiMember::weights_from_vector(VECT)
+
+
+m.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+Species+
+              Social_dist.sq:Species+Genetic_dist.sq:Species+
+               (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+# Social_dist.sq:Species+
+m.1<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+Species+
+              Genetic_dist.sq:Species+
+               (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+#Genetic_dist.sq:Species+
+m.2<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+Species+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+#Species+
+m.3<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+#Genetic
+m.4<-lmer(value.logit ~ Social_dist.sq+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+#Social_dist.sq+
+m.5<-lmer(value.logit ~ Genetic_dist.sq+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+A.1<-anova(m.0,m.1)
+A.2<-anova(m.2,m.1)
+A.3<-anova(m.2,m.3)
+A.4<-anova(m.4,m.3)
+A.5<-anova(m.3,m.5)
+
+R.rand<-MuMIn::r.squaredGLMM(m.3)[2]
+R.SG<-MuMIn::r.squaredGLMM(m.3)[1]
+R.S<-MuMIn::r.squaredGLMM(m.4)[1]
+R.G<-MuMIn::r.squaredGLMM(m.5)[1]
+
+Predictor<-c("Subspecies x Social","Subspecies x Genetic","Subspecies","Genetic","Social" )
+DF.LR<-data.frame(Predictor,
+                  rbind(A.1[2,],A.2[2,],A.3[2,],A.4[2,],A.5[2,]))
+INTERSECT<-R.S+R.G-R.SG
+R2<-c(R.rand,INTERSECT,R.S-INTERSECT,R.G-INTERSECT)
+names(R2)<-c("individual","both","social","genetic")
+
+##########
+DF.LR.CO_BC<-DF.LR
+R2_CO_BC<-R2
+
+######ILEUM#############
+DATA<-IL.Bray.fin
+FILT<-!is.na(DATA$Genetic_dist)&!is.na(DATA$Social_dist)
+DATA<-DATA[FILT,]
+DATA$Social_dist.sq<-DATA$Social_dist^0.5
+DATA$Genetic_dist.sq<-DATA$Genetic_dist^0.5
+DATA$value.logit<-car::logit(DATA$value)
+VECT<-paste(DATA$Var1,DATA$Var2,sep=",")
+MAT<-lmerMultiMember::weights_from_vector(VECT)
+
+
+m.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+Species+
+              Social_dist.sq:Species+Genetic_dist.sq:Species+
+               (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+# Social_dist.sq:Species+
+m.1<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+Species+
+              Genetic_dist.sq:Species+
+               (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+#Genetic_dist.sq:Species+
+m.2<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+Species+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+#Species+
+m.3<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+#Genetic
+m.4<-lmer(value.logit ~ Social_dist.sq+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+#Social_dist.sq+
+m.5<-lmer(value.logit ~ Genetic_dist.sq+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+A.1<-anova(m.0,m.1)
+A.2<-anova(m.2,m.1)
+A.3<-anova(m.2,m.3)
+A.4<-anova(m.4,m.3)
+A.5<-anova(m.3,m.5)
+
+R.rand<-MuMIn::r.squaredGLMM(m.3)[2]
+R.SG<-MuMIn::r.squaredGLMM(m.3)[1]
+R.S<-MuMIn::r.squaredGLMM(m.4)[1]
+R.G<-MuMIn::r.squaredGLMM(m.5)[1]
+
+Predictor<-c("Subspecies x Social","Subspecies x Genetic","Subspecies","Genetic","Social" )
+DF.LR<-data.frame(Predictor,
+                  rbind(A.1[2,],A.2[2,],A.3[2,],A.4[2,],A.5[2,]))
+INTERSECT<-R.S+R.G-R.SG
+R2<-c(R.rand,INTERSECT,R.S-INTERSECT,R.G-INTERSECT)
+names(R2)<-c("individual","both","social","genetic")
+
+##########
+DF.LR.IL_BC<-DF.LR
+R2_IL_BC<-R2
+
+
+##############################
+#JACCARD##################
+##############################
+
+######Caecum#############
+DATA<-CA.Jaccard.fin
+FILT<-!is.na(DATA$Genetic_dist)&!is.na(DATA$Social_dist)
+DATA<-DATA[FILT,]
+DATA$Social_dist.sq<-DATA$Social_dist^0.5
+DATA$Genetic_dist.sq<-DATA$Genetic_dist^0.5
+DATA$value.logit<-car::logit(DATA$value)
+VECT<-paste(DATA$Var1,DATA$Var2,sep=",")
+MAT<-lmerMultiMember::weights_from_vector(VECT)
+
+
+m.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+Species+
+              Social_dist.sq:Species+Genetic_dist.sq:Species+
+               (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+# Social_dist.sq:Species+
+m.1<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+Species+
+              Genetic_dist.sq:Species+
+               (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+#Genetic_dist.sq:Species+
+m.2<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+Species+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+#Species+
+m.3<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+#Genetic
+m.4<-lmer(value.logit ~ Social_dist.sq+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+#Social_dist.sq+
+m.5<-lmer(value.logit ~ Genetic_dist.sq+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+A.1<-anova(m.0,m.1)
+A.2<-anova(m.2,m.1)
+A.3<-anova(m.2,m.3)
+A.4<-anova(m.4,m.3)
+A.5<-anova(m.3,m.5)
+
+R.rand<-MuMIn::r.squaredGLMM(m.3)[2]
+R.SG<-MuMIn::r.squaredGLMM(m.3)[1]
+R.S<-MuMIn::r.squaredGLMM(m.4)[1]
+R.G<-MuMIn::r.squaredGLMM(m.5)[1]
+
+Predictor<-c("Subspecies x Social","Subspecies x Genetic","Subspecies","Genetic","Social" )
+DF.LR<-data.frame(Predictor,
+                  rbind(A.1[2,],A.2[2,],A.3[2,],A.4[2,],A.5[2,]))
+INTERSECT<-R.S+R.G-R.SG
+R2<-c(R.rand,INTERSECT,R.S-INTERSECT,R.G-INTERSECT)
+names(R2)<-c("individual","both","social","genetic")
+
+##########
+DF.LR.CA_JA<-DF.LR
+R2_CA_JA<-R2
+
+######COLON#############
+DATA<-CO.Jaccard.fin
+FILT<-!is.na(DATA$Genetic_dist)&!is.na(DATA$Social_dist)
+DATA<-DATA[FILT,]
+DATA$Social_dist.sq<-DATA$Social_dist^0.5
+DATA$Genetic_dist.sq<-DATA$Genetic_dist^0.5
+DATA$value.logit<-car::logit(DATA$value)
+VECT<-paste(DATA$Var1,DATA$Var2,sep=",")
+MAT<-lmerMultiMember::weights_from_vector(VECT)
+
+
+m.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+Species+
+              Social_dist.sq:Species+Genetic_dist.sq:Species+
+               (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+# Social_dist.sq:Species+
+m.1<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+Species+
+              Genetic_dist.sq:Species+
+               (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+#Genetic_dist.sq:Species+
+m.2<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+Species+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+#Species+
+m.3<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+#Genetic
+m.4<-lmer(value.logit ~ Social_dist.sq+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+#Social_dist.sq+
+m.5<-lmer(value.logit ~ Genetic_dist.sq+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+A.1<-anova(m.0,m.1)
+A.2<-anova(m.2,m.1)
+A.3<-anova(m.2,m.3)
+A.4<-anova(m.4,m.3)
+A.5<-anova(m.3,m.5)
+
+R.rand<-MuMIn::r.squaredGLMM(m.3)[2]
+R.SG<-MuMIn::r.squaredGLMM(m.3)[1]
+R.S<-MuMIn::r.squaredGLMM(m.4)[1]
+R.G<-MuMIn::r.squaredGLMM(m.5)[1]
+
+Predictor<-c("Subspecies x Social","Subspecies x Genetic","Subspecies","Genetic","Social" )
+DF.LR<-data.frame(Predictor,
+                  rbind(A.1[2,],A.2[2,],A.3[2,],A.4[2,],A.5[2,]))
+INTERSECT<-R.S+R.G-R.SG
+R2<-c(R.rand,INTERSECT,R.S-INTERSECT,R.G-INTERSECT)
+names(R2)<-c("individual","both","social","genetic")
+
+##########
+DF.LR.CO_JA<-DF.LR
+R2_CO_JA<-R2
+
+######ILEUM#############
+DATA<-IL.Jaccard.fin
+FILT<-!is.na(DATA$Genetic_dist)&!is.na(DATA$Social_dist)
+DATA<-DATA[FILT,]
+DATA$Social_dist.sq<-DATA$Social_dist^0.5
+DATA$Genetic_dist.sq<-DATA$Genetic_dist^0.5
+DATA$value.logit<-car::logit(DATA$value)
+VECT<-paste(DATA$Var1,DATA$Var2,sep=",")
+MAT<-lmerMultiMember::weights_from_vector(VECT)
+
+
+m.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+Species+
+              Social_dist.sq:Species+Genetic_dist.sq:Species+
+               (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+# Social_dist.sq:Species+
+m.1<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+Species+
+              Genetic_dist.sq:Species+
+               (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+#Genetic_dist.sq:Species+
+m.2<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+Species+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+#Species+
+m.3<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+#Genetic
+m.4<-lmer(value.logit ~ Social_dist.sq+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+#Social_dist.sq+
+m.5<-lmer(value.logit ~ Genetic_dist.sq+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+A.1<-anova(m.0,m.1)
+A.2<-anova(m.2,m.1)
+A.3<-anova(m.2,m.3)
+A.4<-anova(m.4,m.3)
+A.5<-anova(m.3,m.5)
+
+R.rand<-MuMIn::r.squaredGLMM(m.3)[2]
+R.SG<-MuMIn::r.squaredGLMM(m.3)[1]
+R.S<-MuMIn::r.squaredGLMM(m.4)[1]
+R.G<-MuMIn::r.squaredGLMM(m.5)[1]
+
+Predictor<-c("Subspecies x Social","Subspecies x Genetic","Subspecies","Genetic","Social" )
+DF.LR<-data.frame(Predictor,
+                  rbind(A.1[2,],A.2[2,],A.3[2,],A.4[2,],A.5[2,]))
+INTERSECT<-R.S+R.G-R.SG
+R2<-c(R.rand,INTERSECT,R.S-INTERSECT,R.G-INTERSECT)
+names(R2)<-c("individual","both","social","genetic")
+
+##########
+DF.LR.IL_JA<-DF.LR
+R2_IL_JA<-R2
+
+
+############################
+#Final DF###################
+############################
+DF.LR.all<-data.frame(
+Similarity=rep(c("Bray-Curtis","Jaccard"),each=dim(DF.LR.CA_BC)[1]*3),
+Gut_section=rep(c("Caecum","Colon","Ileum","Caecum","Colon","Ileum"), each=dim(DF.LR.CA_BC)[1]),
+rbind(DF.LR.CA_BC,DF.LR.CO_BC,DF.LR.IL_BC,
+      DF.LR.CA_JA,DF.LR.CO_JA,DF.LR.IL_JA))
+
+DF.LR.all$Gut_section<-as.factor(DF.LR.all$Gut_section)
+DF.LR.all$Gut_section<-factor(DF.LR.all$Gut_section,levels=c("Ileum","Caecum","Colon"))
+DF.LR.all <- DF.LR.all[order(DF.LR.all$Similarity, DF.LR.all$Gut_section),]
+
+
+#Table S2
+write.table(DF.LR.all[,c(1:3,10,9,11)],
+            file = "~/data/Areny_social/RESULTS_revision/Multi_member_interactions.txt",
+            sep="\t",quote = F,row.names = F)
+
+DF.LR.all[,c(1:3,10,9,11)]
+```
+
+# LMMs for each subsepcies
+
+As the interactions between species identity and other predictors were highly significant in the above analyses, separate models were fitted for each subspecies in the next step. These were used to estimate the variance associated with genetic relatedness and social interactions (calculated using calcVarPart() function).
+
+```{r}
+##############################
+#BRAY-CURTIS##################
+##############################
+
+######Caecum#############
+DATA<-CA.Bray.fin
+FILT<-!is.na(DATA$Genetic_dist)&!is.na(DATA$Social_dist)
+DATA<-DATA[FILT,]
+DATA$Social_dist.sq<-DATA$Social_dist^0.5
+DATA$Genetic_dist.sq<-DATA$Genetic_dist^0.5
+DATA$value.logit<-car::logit(DATA$value)
+
+DATA.mmm<-DATA[DATA$Species=="MMM",]
+DATA.mmd<-DATA[DATA$Species=="MMD",]
+
+VECT.mmm<-paste(DATA.mmm$Var1,DATA.mmm$Var2,sep=",")
+MAT.mmm<-lmerMultiMember::weights_from_vector(VECT.mmm)
+VECT.mmd<-paste(DATA.mmd$Var1,DATA.mmd$Var2,sep=",")
+MAT.mmd<-lmerMultiMember::weights_from_vector(VECT.mmd)
+
+###mmm###
+mmm.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+#soc
+mmm.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+#genet
+mmm.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+A1.mmm<-anova(mmm.0,mmm.1)
+A2.mmm<-anova(mmm.0,mmm.2)
+
+R.rand.mmm<-MuMIn::r.squaredGLMM(mmm.0)[2]
+R.SG.mmm<-MuMIn::r.squaredGLMM(mmm.0)[1]
+R.S.mmm<-MuMIn::r.squaredGLMM(mmm.2)[1]
+R.G.mmm<-MuMIn::r.squaredGLMM(mmm.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmm<-data.frame(Predictor,
+                  rbind(A1.mmm[2,],A2.mmm[2,]))
+
+INTERSECT<-R.S.mmm+R.G.mmm-R.SG.mmm
+R2.mmm<-c(R.rand.mmm,INTERSECT,R.S.mmm-INTERSECT,R.G.mmm-INTERSECT)
+names(R2.mmm)<-c("individual","both","social","genetic")
+VP.mmm<-calcVarPart(mmm.0)
+
+###mmd###
+mmd.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+#soc
+mmd.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+#genet
+mmd.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+A1.mmd<-anova(mmd.0,mmd.1)
+A2.mmd<-anova(mmd.0,mmd.2)
+
+R.rand.mmd<-MuMIn::r.squaredGLMM(mmd.0)[2]
+R.SG.mmd<-MuMIn::r.squaredGLMM(mmd.0)[1]
+R.S.mmd<-MuMIn::r.squaredGLMM(mmd.2)[1]
+R.G.mmd<-MuMIn::r.squaredGLMM(mmd.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmd<-data.frame(Predictor,
+                  rbind(A1.mmd[2,],A2.mmd[2,]))
+
+INTERSECT<-R.S.mmd+R.G.mmd-R.SG.mmd
+R2.mmd<-c(R.rand.mmd,INTERSECT,R.S.mmd-INTERSECT,R.G.mmd-INTERSECT)
+names(R2.mmd)<-c("individual","both","social","genetic")
+
+VP.mmd<-calcVarPart(mmd.0)
+
+#####res
+DF.LR.mmm.CA_BC<-DF.LR.mmm
+DF.LR.mmd.CA_BC<-DF.LR.mmd
+R2.mmm.CA_BC<-R2.mmm
+R2.mmd.CA_BC<-R2.mmd
+VP.mmm.CA_BC<-VP.mmm
+VP.mmd.CA_BC<-VP.mmd
+
+
+######Colon#############
+DATA<-CO.Bray.fin
+FILT<-!is.na(DATA$Genetic_dist)&!is.na(DATA$Social_dist)
+DATA<-DATA[FILT,]
+DATA$Social_dist.sq<-DATA$Social_dist^0.5
+DATA$Genetic_dist.sq<-DATA$Genetic_dist^0.5
+DATA$value.logit<-car::logit(DATA$value)
+
+DATA.mmm<-DATA[DATA$Species=="MMM",]
+DATA.mmd<-DATA[DATA$Species=="MMD",]
+
+VECT.mmm<-paste(DATA.mmm$Var1,DATA.mmm$Var2,sep=",")
+MAT.mmm<-lmerMultiMember::weights_from_vector(VECT.mmm)
+VECT.mmd<-paste(DATA.mmd$Var1,DATA.mmd$Var2,sep=",")
+MAT.mmd<-lmerMultiMember::weights_from_vector(VECT.mmd)
+
+###mmm###
+mmm.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+#soc
+mmm.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+#genet
+mmm.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+A1.mmm<-anova(mmm.0,mmm.1)
+A2.mmm<-anova(mmm.0,mmm.2)
+
+R.rand.mmm<-MuMIn::r.squaredGLMM(mmm.0)[2]
+R.SG.mmm<-MuMIn::r.squaredGLMM(mmm.0)[1]
+R.S.mmm<-MuMIn::r.squaredGLMM(mmm.2)[1]
+R.G.mmm<-MuMIn::r.squaredGLMM(mmm.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmm<-data.frame(Predictor,
+                  rbind(A1.mmm[2,],A2.mmm[2,]))
+
+INTERSECT<-R.S.mmm+R.G.mmm-R.SG.mmm
+R2.mmm<-c(R.rand.mmm,INTERSECT,R.S.mmm-INTERSECT,R.G.mmm-INTERSECT)
+names(R2.mmm)<-c("individual","both","social","genetic")
+VP.mmm<-calcVarPart(mmm.0)
+
+###mmd###
+mmd.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+#soc
+mmd.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+#genet
+mmd.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+A1.mmd<-anova(mmd.0,mmd.1)
+A2.mmd<-anova(mmd.0,mmd.2)
+
+R.rand.mmd<-MuMIn::r.squaredGLMM(mmd.0)[2]
+R.SG.mmd<-MuMIn::r.squaredGLMM(mmd.0)[1]
+R.S.mmd<-MuMIn::r.squaredGLMM(mmd.2)[1]
+R.G.mmd<-MuMIn::r.squaredGLMM(mmd.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmd<-data.frame(Predictor,
+                  rbind(A1.mmd[2,],A2.mmd[2,]))
+
+INTERSECT<-R.S.mmd+R.G.mmd-R.SG.mmd
+R2.mmd<-c(R.rand.mmd,INTERSECT,R.S.mmd-INTERSECT,R.G.mmd-INTERSECT)
+names(R2.mmd)<-c("individual","both","social","genetic")
+VP.mmm<-calcVarPart(mmm.0)
+
+#####res
+DF.LR.mmm.CO_BC<-DF.LR.mmm
+DF.LR.mmd.CO_BC<-DF.LR.mmd
+R2.mmm.CO_BC<-R2.mmm
+R2.mmd.CO_BC<-R2.mmd
+VP.mmm.CO_BC<-VP.mmm
+VP.mmd.CO_BC<-VP.mmd
+
+######Ileum#############
+DATA<-IL.Bray.fin
+FILT<-!is.na(DATA$Genetic_dist)&!is.na(DATA$Social_dist)
+DATA<-DATA[FILT,]
+DATA$Social_dist.sq<-DATA$Social_dist^0.5
+DATA$Genetic_dist.sq<-DATA$Genetic_dist^0.5
+DATA$value.logit<-car::logit(DATA$value)
+
+DATA.mmm<-DATA[DATA$Species=="MMM",]
+DATA.mmd<-DATA[DATA$Species=="MMD",]
+
+VECT.mmm<-paste(DATA.mmm$Var1,DATA.mmm$Var2,sep=",")
+MAT.mmm<-lmerMultiMember::weights_from_vector(VECT.mmm)
+VECT.mmd<-paste(DATA.mmd$Var1,DATA.mmd$Var2,sep=",")
+MAT.mmd<-lmerMultiMember::weights_from_vector(VECT.mmd)
+
+###mmm###
+mmm.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+#soc
+mmm.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+#genet
+mmm.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+A1.mmm<-anova(mmm.0,mmm.1)
+A2.mmm<-anova(mmm.0,mmm.2)
+
+R.rand.mmm<-MuMIn::r.squaredGLMM(mmm.0)[2]
+R.SG.mmm<-MuMIn::r.squaredGLMM(mmm.0)[1]
+R.S.mmm<-MuMIn::r.squaredGLMM(mmm.2)[1]
+R.G.mmm<-MuMIn::r.squaredGLMM(mmm.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmm<-data.frame(Predictor,
+                  rbind(A1.mmm[2,],A2.mmm[2,]))
+
+INTERSECT<-R.S.mmm+R.G.mmm-R.SG.mmm
+R2.mmm<-c(R.rand.mmm,INTERSECT,R.S.mmm-INTERSECT,R.G.mmm-INTERSECT)
+names(R2.mmm)<-c("individual","both","social","genetic")
+VP.mmm<-calcVarPart(mmm.0)
+
+###mmd###
+mmd.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+#soc
+mmd.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+#genet
+mmd.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+A1.mmd<-anova(mmd.0,mmd.1)
+A2.mmd<-anova(mmd.0,mmd.2)
+
+R.rand.mmd<-MuMIn::r.squaredGLMM(mmd.0)[2]
+R.SG.mmd<-MuMIn::r.squaredGLMM(mmd.0)[1]
+R.S.mmd<-MuMIn::r.squaredGLMM(mmd.2)[1]
+R.G.mmd<-MuMIn::r.squaredGLMM(mmd.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmd<-data.frame(Predictor,
+                  rbind(A1.mmd[2,],A2.mmd[2,]))
+
+INTERSECT<-R.S.mmd+R.G.mmd-R.SG.mmd
+R2.mmd<-c(R.rand.mmd,INTERSECT,R.S.mmd-INTERSECT,R.G.mmd-INTERSECT)
+names(R2.mmd)<-c("individual","both","social","genetic")
+VP.mmd<-calcVarPart(mmd.0)
+
+#####res
+DF.LR.mmm.IL_BC<-DF.LR.mmm
+DF.LR.mmd.IL_BC<-DF.LR.mmd
+R2.mmm.IL_BC<-R2.mmm
+R2.mmd.IL_BC<-R2.mmd
+VP.mmm.IL_BC<-VP.mmm
+VP.mmd.IL_BC<-VP.mmd
+
+
+##############################
+#JACCARD##################
+##############################
+
+######Caecum#############
+DATA<-CA.Jaccard.fin
+FILT<-!is.na(DATA$Genetic_dist)&!is.na(DATA$Social_dist)
+DATA<-DATA[FILT,]
+DATA$Social_dist.sq<-DATA$Social_dist^0.5
+DATA$Genetic_dist.sq<-DATA$Genetic_dist^0.5
+DATA$value.logit<-car::logit(DATA$value)
+
+DATA.mmm<-DATA[DATA$Species=="MMM",]
+DATA.mmd<-DATA[DATA$Species=="MMD",]
+
+VECT.mmm<-paste(DATA.mmm$Var1,DATA.mmm$Var2,sep=",")
+MAT.mmm<-lmerMultiMember::weights_from_vector(VECT.mmm)
+VECT.mmd<-paste(DATA.mmd$Var1,DATA.mmd$Var2,sep=",")
+MAT.mmd<-lmerMultiMember::weights_from_vector(VECT.mmd)
+
+###mmm###
+mmm.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+#soc
+mmm.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+#genet
+mmm.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+A1.mmm<-anova(mmm.0,mmm.1)
+A2.mmm<-anova(mmm.0,mmm.2)
+
+R.rand.mmm<-MuMIn::r.squaredGLMM(mmm.0)[2]
+R.SG.mmm<-MuMIn::r.squaredGLMM(mmm.0)[1]
+R.S.mmm<-MuMIn::r.squaredGLMM(mmm.2)[1]
+R.G.mmm<-MuMIn::r.squaredGLMM(mmm.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmm<-data.frame(Predictor,
+                  rbind(A1.mmm[2,],A2.mmm[2,]))
+
+INTERSECT<-R.S.mmm+R.G.mmm-R.SG.mmm
+R2.mmm<-c(R.rand.mmm,INTERSECT,R.S.mmm-INTERSECT,R.G.mmm-INTERSECT)
+names(R2.mmm)<-c("individual","both","social","genetic")
+VP.mmm<-calcVarPart(mmm.0)
+
+###mmd###
+mmd.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+#soc
+mmd.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+#genet
+mmd.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+A1.mmd<-anova(mmd.0,mmd.1)
+A2.mmd<-anova(mmd.0,mmd.2)
+
+R.rand.mmd<-MuMIn::r.squaredGLMM(mmd.0)[2]
+R.SG.mmd<-MuMIn::r.squaredGLMM(mmd.0)[1]
+R.S.mmd<-MuMIn::r.squaredGLMM(mmd.2)[1]
+R.G.mmd<-MuMIn::r.squaredGLMM(mmd.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmd<-data.frame(Predictor,
+                  rbind(A1.mmd[2,],A2.mmd[2,]))
+
+INTERSECT<-R.S.mmd+R.G.mmd-R.SG.mmd
+R2.mmd<-c(R.rand.mmd,INTERSECT,R.S.mmd-INTERSECT,R.G.mmd-INTERSECT)
+names(R2.mmd)<-c("individual","both","social","genetic")
+VP.mmd<-calcVarPart(mmd.0)
+
+#####res
+DF.LR.mmm.CA_JA<-DF.LR.mmm
+DF.LR.mmd.CA_JA<-DF.LR.mmd
+R2.mmm.CA_JA<-R2.mmm
+R2.mmd.CA_JA<-R2.mmd
+VP.mmm.CA_JA<-VP.mmm
+VP.mmd.CA_JA<-VP.mmd
+
+######Colon#############
+DATA<-CO.Jaccard.fin
+FILT<-!is.na(DATA$Genetic_dist)&!is.na(DATA$Social_dist)
+DATA<-DATA[FILT,]
+DATA$Social_dist.sq<-DATA$Social_dist^0.5
+DATA$Genetic_dist.sq<-DATA$Genetic_dist^0.5
+DATA$value.logit<-car::logit(DATA$value)
+
+DATA.mmm<-DATA[DATA$Species=="MMM",]
+DATA.mmd<-DATA[DATA$Species=="MMD",]
+
+VECT.mmm<-paste(DATA.mmm$Var1,DATA.mmm$Var2,sep=",")
+MAT.mmm<-lmerMultiMember::weights_from_vector(VECT.mmm)
+VECT.mmd<-paste(DATA.mmd$Var1,DATA.mmd$Var2,sep=",")
+MAT.mmd<-lmerMultiMember::weights_from_vector(VECT.mmd)
+
+###mmm###
+mmm.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+#soc
+mmm.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+#genet
+mmm.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+A1.mmm<-anova(mmm.0,mmm.1)
+A2.mmm<-anova(mmm.0,mmm.2)
+
+R.rand.mmm<-MuMIn::r.squaredGLMM(mmm.0)[2]
+R.SG.mmm<-MuMIn::r.squaredGLMM(mmm.0)[1]
+R.S.mmm<-MuMIn::r.squaredGLMM(mmm.2)[1]
+R.G.mmm<-MuMIn::r.squaredGLMM(mmm.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmm<-data.frame(Predictor,
+                  rbind(A1.mmm[2,],A2.mmm[2,]))
+
+INTERSECT<-R.S.mmm+R.G.mmm-R.SG.mmm
+R2.mmm<-c(R.rand.mmm,INTERSECT,R.S.mmm-INTERSECT,R.G.mmm-INTERSECT)
+names(R2.mmm)<-c("individual","both","social","genetic")
+VP.mmm<-calcVarPart(mmm.0)
+
+###mmd###
+mmd.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+#soc
+mmd.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+#genet
+mmd.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+A1.mmd<-anova(mmd.0,mmd.1)
+A2.mmd<-anova(mmd.0,mmd.2)
+
+R.rand.mmd<-MuMIn::r.squaredGLMM(mmd.0)[2]
+R.SG.mmd<-MuMIn::r.squaredGLMM(mmd.0)[1]
+R.S.mmd<-MuMIn::r.squaredGLMM(mmd.2)[1]
+R.G.mmd<-MuMIn::r.squaredGLMM(mmd.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmd<-data.frame(Predictor,
+                  rbind(A1.mmd[2,],A2.mmd[2,]))
+
+INTERSECT<-R.S.mmd+R.G.mmd-R.SG.mmd
+R2.mmd<-c(R.rand.mmd,INTERSECT,R.S.mmd-INTERSECT,R.G.mmd-INTERSECT)
+names(R2.mmd)<-c("individual","both","social","genetic")
+
+#####res
+DF.LR.mmm.CO_JA<-DF.LR.mmm
+DF.LR.mmd.CO_JA<-DF.LR.mmd
+R2.mmm.CO_JA<-R2.mmm
+R2.mmd.CO_JA<-R2.mmd
+VP.mmd<-calcVarPart(mmd.0)
+VP.mmm.CO_JA<-VP.mmm
+VP.mmd.CO_JA<-VP.mmd
+
+######Ileum#############
+DATA<-IL.Jaccard.fin
+FILT<-!is.na(DATA$Genetic_dist)&!is.na(DATA$Social_dist)
+DATA<-DATA[FILT,]
+DATA$Social_dist.sq<-DATA$Social_dist^0.5
+DATA$Genetic_dist.sq<-DATA$Genetic_dist^0.5
+DATA$value.logit<-car::logit(DATA$value)
+
+DATA.mmm<-DATA[DATA$Species=="MMM",]
+DATA.mmd<-DATA[DATA$Species=="MMD",]
+
+VECT.mmm<-paste(DATA.mmm$Var1,DATA.mmm$Var2,sep=",")
+MAT.mmm<-lmerMultiMember::weights_from_vector(VECT.mmm)
+VECT.mmd<-paste(DATA.mmd$Var1,DATA.mmd$Var2,sep=",")
+MAT.mmd<-lmerMultiMember::weights_from_vector(VECT.mmd)
+
+###mmm###
+mmm.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+#soc
+mmm.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+#genet
+mmm.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+A1.mmm<-anova(mmm.0,mmm.1)
+A2.mmm<-anova(mmm.0,mmm.2)
+
+R.rand.mmm<-MuMIn::r.squaredGLMM(mmm.0)[2]
+R.SG.mmm<-MuMIn::r.squaredGLMM(mmm.0)[1]
+R.S.mmm<-MuMIn::r.squaredGLMM(mmm.2)[1]
+R.G.mmm<-MuMIn::r.squaredGLMM(mmm.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmm<-data.frame(Predictor,
+                  rbind(A1.mmm[2,],A2.mmm[2,]))
+
+INTERSECT<-R.S.mmm+R.G.mmm-R.SG.mmm
+R2.mmm<-c(R.rand.mmm,INTERSECT,R.S.mmm-INTERSECT,R.G.mmm-INTERSECT)
+names(R2.mmm)<-c("individual","both","social","genetic")
+VP.mmm<-calcVarPart(mmm.0)
+
+###mmd###
+mmd.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+#soc
+mmd.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+#genet
+mmd.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+A1.mmd<-anova(mmd.0,mmd.1)
+A2.mmd<-anova(mmd.0,mmd.2)
+
+R.rand.mmd<-MuMIn::r.squaredGLMM(mmd.0)[2]
+R.SG.mmd<-MuMIn::r.squaredGLMM(mmd.0)[1]
+R.S.mmd<-MuMIn::r.squaredGLMM(mmd.2)[1]
+R.G.mmd<-MuMIn::r.squaredGLMM(mmd.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmd<-data.frame(Predictor,
+                  rbind(A1.mmd[2,],A2.mmd[2,]))
+
+INTERSECT<-R.S.mmd+R.G.mmd-R.SG.mmd
+R2.mmd<-c(R.rand.mmd,INTERSECT,R.S.mmd-INTERSECT,R.G.mmd-INTERSECT)
+names(R2.mmd)<-c("individual","both","social","genetic")
+VP.mmd<-calcVarPart(mmd.0)
+
+#####res
+DF.LR.mmm.IL_JA<-DF.LR.mmm
+DF.LR.mmd.IL_JA<-DF.LR.mmd
+R2.mmm.IL_JA<-R2.mmm
+R2.mmd.IL_JA<-R2.mmd
+VP.mmm.IL_JA<-VP.mmm
+VP.mmd.IL_JA<-VP.mmd
+```
+# Tables and plots
+
+Table showing the results of the above models and a figure explaining the variance explained by the effect of social interactions and genetic relatedness. 
+
+```{r}
+###############################
+#LR table######################
+###############################
+
+DF.LR.all.JA<-rbind(DF.LR.mmd.CO_JA,
+DF.LR.mmm.CO_JA,
+DF.LR.mmd.CA_JA,
+DF.LR.mmm.CA_JA,
+DF.LR.mmd.IL_JA,
+DF.LR.mmm.IL_JA)
+
+DF.LR.all.BC<-rbind(DF.LR.mmd.CO_BC,
+DF.LR.mmm.CO_BC,
+DF.LR.mmd.CA_BC,
+DF.LR.mmm.CA_BC,
+DF.LR.mmd.IL_BC,
+DF.LR.mmm.IL_BC)
+
+names(DF.LR.all.JA)<-paste0(names(DF.LR.all.JA),"_JA")
+names(DF.LR.all.BC)<-paste0(names(DF.LR.all.BC),"_BC")
+
+DF.LR.all.BC.JC<-data.frame(DF.LR.all.BC[,c(1,8,7,9)],
+                            DF.LR.all.JA[,c(7,9)])
+
+DF.LR.all.BC.JC<-data.frame(gut_section=rep(c("colon","colon","caecum","caecum","ileum","ileum"),each=2),
+                            subspecies=rep(c("mmd","mmd","mmm","mmm"),3),
+                            DF.LR.all.BC.JC)
+
+# table S3
+write.table(DF.LR.all.BC.JC,
+            file = "~/data/Areny_social/RESULTS_revision/Multi_member_SepSpec.txt",
+            sep="\t",quote = F,row.names = F)
+DF.LR.all.BC.JC
+##################################
+#var explained####################
+##################################
+
+EXPL<-rbind(
+VP.mmm.CA_BC,
+VP.mmd.CA_BC,
+VP.mmm.CO_BC,
+VP.mmd.CO_BC,
+VP.mmm.IL_BC,
+VP.mmd.IL_BC,
+VP.mmm.CA_JA,
+VP.mmd.CA_JA,
+VP.mmm.CO_JA,
+VP.mmd.CO_JA,
+VP.mmm.IL_JA,
+VP.mmd.IL_JA)
+
+
+# minus random variation (i.e. associated with random effects)
+SUMS<-rowSums(EXPL[,2:4])
+
+EXPL.x<-EXPL
+for(i in 1:dim(EXPL.x)[2]){
+  EXPL.x[,i]<-EXPL.x[,i]/SUMS
+}
+write.table(data.frame(Set=rownames(EXPL.x),EXPL.x), 
+            file = "~/data/Areny_social/RESULTS_revision/Var_expl.txt",
+            sep="\t",quote = F,row.names = F)
+# EXPL.x<-apply(EXPL,2,function(x) x/SUMS)  
+
+EXPL.l<-melt(EXPL.x)
+EXPL.l$subspecies<-sapply(strsplit(as.character(EXPL.l$Var1), "[.]"), function(x) x[2], simplify=T)
+EXPL.l$gut_section<-sapply(strsplit(as.character(EXPL.l$Var1), "[.]"), function(x) x[3], simplify=T)
+EXPL.l$dissimilarity<-sapply(strsplit(as.character(EXPL.l$gut_section), "[_]"), function(x) x[2], simplify=T)
+EXPL.l$gut_section<-sapply(strsplit(as.character(EXPL.l$gut_section), "[_]"), function(x) x[1], simplify=T)
+
+EXPL.l$gut_section<-gsub("CO","Colon",EXPL.l$gut_section)
+EXPL.l$gut_section<-gsub("CA","Ceacum",EXPL.l$gut_section)
+EXPL.l$gut_section<-gsub("IL","Ileum",EXPL.l$gut_section)
+
+EXPL.l$dissimilarity<-gsub("JA","Jaccard",EXPL.l$dissimilarity)
+EXPL.l$dissimilarity<-gsub("BC","Bray-Curtis",EXPL.l$dissimilarity)
+EXPL.l.s<-EXPL.l[EXPL.l$Var2!="Var1",]
+EXPL.l.s<-EXPL.l.s[EXPL.l.s$Var2!="Residuals",]
+EXPL.l$Var2<-as.character(EXPL.l$Var2)
+EXPL.l.s$Var2<-ifelse(EXPL.l.s$Var2=="Social_dist.sq","Social int.", "Relatedness")
+
+
+EXPL.l.s$gut_section<-as.factor(EXPL.l.s$gut_section)
+EXPL.l.s$gut_section<-factor(EXPL.l.s$gut_section,levels=c("Ileum","Ceacum","Colon"))
+
+GG<-ggplot(data=EXPL.l.s,aes(y=value,x=subspecies,fill=Var2))+geom_bar(stat = "identity", position = "stack")+
+  facet_nested(dissimilarity~gut_section)
+
+GG.S<-small_fig(GG+theme_bw()) +  labs(y = "Variance explained", x = "subspecies")+theme(legend.title = element_blank(),
+                                                                                 legend.position = "bottom",
+                                                                                 strip.text = element_text(size=8))
+GG.S
+
+# Figure 1
+  ggsave(GG.S,filename = "~/data/Areny_social/RESULTS_revision/LMER_Var_corrected.pdf",
+       width = 8, height = 8, units = "cm")
+
+```
+
+#The same analyse without closely related individuals
+
+Individuals with relatedness index of ~ 0.5 (or higher) or/and individuals from the same litter were not considered.
+
+```{r}
+##############################
+#BRAY-CURTIS##################
+##############################
+
+######Caecum#############
+DATA<-CA.Bray.fin
+FILT<-!is.na(DATA$Genetic_dist)&!is.na(DATA$Social_dist)
+DATA<-DATA[FILT,]
+DATA<-DATA[DATA$Genetic_dist<0.5,]
+FILT<-DATA$vrh_Var1!=DATA$vrh_Var2
+FILT[is.na(FILT)]<-TRUE
+DATA<-DATA[FILT,]
+DATA$Social_dist.sq<-DATA$Social_dist^0.5
+DATA$Genetic_dist.sq<-DATA$Genetic_dist^0.5
+DATA$value.logit<-car::logit(DATA$value)
+
+DATA.mmm<-DATA[DATA$Species=="MMM",]
+DATA.mmd<-DATA[DATA$Species=="MMD",]
+
+VECT.mmm<-paste(DATA.mmm$Var1,DATA.mmm$Var2,sep=",")
+MAT.mmm<-lmerMultiMember::weights_from_vector(VECT.mmm)
+VECT.mmd<-paste(DATA.mmd$Var1,DATA.mmd$Var2,sep=",")
+MAT.mmd<-lmerMultiMember::weights_from_vector(VECT.mmd)
+
+###mmm###
+mmm.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+#soc
+mmm.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+#genet
+mmm.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+A1.mmm<-anova(mmm.0,mmm.1)
+A2.mmm<-anova(mmm.0,mmm.2)
+
+R.rand.mmm<-MuMIn::r.squaredGLMM(mmm.0)[2]
+R.SG.mmm<-MuMIn::r.squaredGLMM(mmm.0)[1]
+R.S.mmm<-MuMIn::r.squaredGLMM(mmm.2)[1]
+R.G.mmm<-MuMIn::r.squaredGLMM(mmm.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmm<-data.frame(Predictor,
+                  rbind(A1.mmm[2,],A2.mmm[2,]))
+
+INTERSECT<-R.S.mmm+R.G.mmm-R.SG.mmm
+R2.mmm<-c(R.rand.mmm,INTERSECT,R.S.mmm-INTERSECT,R.G.mmm-INTERSECT)
+names(R2.mmm)<-c("individual","both","social","genetic")
+VP.mmm<-calcVarPart(mmm.0)
+
+###mmd###
+mmd.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+#soc
+mmd.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+#genet
+mmd.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+A1.mmd<-anova(mmd.0,mmd.1)
+A2.mmd<-anova(mmd.0,mmd.2)
+
+R.rand.mmd<-MuMIn::r.squaredGLMM(mmd.0)[2]
+R.SG.mmd<-MuMIn::r.squaredGLMM(mmd.0)[1]
+R.S.mmd<-MuMIn::r.squaredGLMM(mmd.2)[1]
+R.G.mmd<-MuMIn::r.squaredGLMM(mmd.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmd<-data.frame(Predictor,
+                  rbind(A1.mmd[2,],A2.mmd[2,]))
+
+INTERSECT<-R.S.mmd+R.G.mmd-R.SG.mmd
+R2.mmd<-c(R.rand.mmd,INTERSECT,R.S.mmd-INTERSECT,R.G.mmd-INTERSECT)
+names(R2.mmd)<-c("individual","both","social","genetic")
+
+VP.mmd<-calcVarPart(mmd.0)
+
+#####res
+DF.LR.mmm.CA_BC<-DF.LR.mmm
+DF.LR.mmd.CA_BC<-DF.LR.mmd
+R2.mmm.CA_BC<-R2.mmm
+R2.mmd.CA_BC<-R2.mmd
+VP.mmm.CA_BC<-VP.mmm
+VP.mmd.CA_BC<-VP.mmd
+
+
+######Colon#############
+DATA<-CO.Bray.fin
+FILT<-!is.na(DATA$Genetic_dist)&!is.na(DATA$Social_dist)
+DATA<-DATA[FILT,]
+DATA<-DATA[DATA$Genetic_dist<0.5,]
+FILT<-DATA$vrh_Var1!=DATA$vrh_Var2
+FILT[is.na(FILT)]<-TRUE
+DATA<-DATA[FILT,]
+DATA$Social_dist.sq<-DATA$Social_dist^0.5
+DATA$Genetic_dist.sq<-DATA$Genetic_dist^0.5
+DATA$value.logit<-car::logit(DATA$value)
+
+DATA.mmm<-DATA[DATA$Species=="MMM",]
+DATA.mmd<-DATA[DATA$Species=="MMD",]
+
+VECT.mmm<-paste(DATA.mmm$Var1,DATA.mmm$Var2,sep=",")
+MAT.mmm<-lmerMultiMember::weights_from_vector(VECT.mmm)
+VECT.mmd<-paste(DATA.mmd$Var1,DATA.mmd$Var2,sep=",")
+MAT.mmd<-lmerMultiMember::weights_from_vector(VECT.mmd)
+
+###mmm###
+mmm.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+#soc
+mmm.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+#genet
+mmm.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+A1.mmm<-anova(mmm.0,mmm.1)
+A2.mmm<-anova(mmm.0,mmm.2)
+
+R.rand.mmm<-MuMIn::r.squaredGLMM(mmm.0)[2]
+R.SG.mmm<-MuMIn::r.squaredGLMM(mmm.0)[1]
+R.S.mmm<-MuMIn::r.squaredGLMM(mmm.2)[1]
+R.G.mmm<-MuMIn::r.squaredGLMM(mmm.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmm<-data.frame(Predictor,
+                  rbind(A1.mmm[2,],A2.mmm[2,]))
+
+INTERSECT<-R.S.mmm+R.G.mmm-R.SG.mmm
+R2.mmm<-c(R.rand.mmm,INTERSECT,R.S.mmm-INTERSECT,R.G.mmm-INTERSECT)
+names(R2.mmm)<-c("individual","both","social","genetic")
+VP.mmm<-calcVarPart(mmm.0)
+
+###mmd###
+mmd.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+#soc
+mmd.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+#genet
+mmd.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+A1.mmd<-anova(mmd.0,mmd.1)
+A2.mmd<-anova(mmd.0,mmd.2)
+
+R.rand.mmd<-MuMIn::r.squaredGLMM(mmd.0)[2]
+R.SG.mmd<-MuMIn::r.squaredGLMM(mmd.0)[1]
+R.S.mmd<-MuMIn::r.squaredGLMM(mmd.2)[1]
+R.G.mmd<-MuMIn::r.squaredGLMM(mmd.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmd<-data.frame(Predictor,
+                  rbind(A1.mmd[2,],A2.mmd[2,]))
+
+INTERSECT<-R.S.mmd+R.G.mmd-R.SG.mmd
+R2.mmd<-c(R.rand.mmd,INTERSECT,R.S.mmd-INTERSECT,R.G.mmd-INTERSECT)
+names(R2.mmd)<-c("individual","both","social","genetic")
+VP.mmm<-calcVarPart(mmm.0)
+
+#####res
+DF.LR.mmm.CO_BC<-DF.LR.mmm
+DF.LR.mmd.CO_BC<-DF.LR.mmd
+R2.mmm.CO_BC<-R2.mmm
+R2.mmd.CO_BC<-R2.mmd
+VP.mmm.CO_BC<-VP.mmm
+VP.mmd.CO_BC<-VP.mmd
+
+######Ileum#############
+DATA<-IL.Bray.fin
+FILT<-!is.na(DATA$Genetic_dist)&!is.na(DATA$Social_dist)
+DATA<-DATA[FILT,]
+DATA<-DATA[DATA$Genetic_dist<0.5,]
+FILT<-DATA$vrh_Var1!=DATA$vrh_Var2
+FILT[is.na(FILT)]<-TRUE
+DATA<-DATA[FILT,]
+
+DATA$Social_dist.sq<-DATA$Social_dist^0.5
+DATA$Genetic_dist.sq<-DATA$Genetic_dist^0.5
+DATA$value.logit<-car::logit(DATA$value)
+
+DATA.mmm<-DATA[DATA$Species=="MMM",]
+DATA.mmd<-DATA[DATA$Species=="MMD",]
+
+VECT.mmm<-paste(DATA.mmm$Var1,DATA.mmm$Var2,sep=",")
+MAT.mmm<-lmerMultiMember::weights_from_vector(VECT.mmm)
+VECT.mmd<-paste(DATA.mmd$Var1,DATA.mmd$Var2,sep=",")
+MAT.mmd<-lmerMultiMember::weights_from_vector(VECT.mmd)
+
+###mmm###
+mmm.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+#soc
+mmm.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+#genet
+mmm.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+A1.mmm<-anova(mmm.0,mmm.1)
+A2.mmm<-anova(mmm.0,mmm.2)
+
+R.rand.mmm<-MuMIn::r.squaredGLMM(mmm.0)[2]
+R.SG.mmm<-MuMIn::r.squaredGLMM(mmm.0)[1]
+R.S.mmm<-MuMIn::r.squaredGLMM(mmm.2)[1]
+R.G.mmm<-MuMIn::r.squaredGLMM(mmm.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmm<-data.frame(Predictor,
+                  rbind(A1.mmm[2,],A2.mmm[2,]))
+
+INTERSECT<-R.S.mmm+R.G.mmm-R.SG.mmm
+R2.mmm<-c(R.rand.mmm,INTERSECT,R.S.mmm-INTERSECT,R.G.mmm-INTERSECT)
+names(R2.mmm)<-c("individual","both","social","genetic")
+VP.mmm<-calcVarPart(mmm.0)
+
+###mmd###
+mmd.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+#soc
+mmd.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+#genet
+mmd.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+A1.mmd<-anova(mmd.0,mmd.1)
+A2.mmd<-anova(mmd.0,mmd.2)
+
+R.rand.mmd<-MuMIn::r.squaredGLMM(mmd.0)[2]
+R.SG.mmd<-MuMIn::r.squaredGLMM(mmd.0)[1]
+R.S.mmd<-MuMIn::r.squaredGLMM(mmd.2)[1]
+R.G.mmd<-MuMIn::r.squaredGLMM(mmd.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmd<-data.frame(Predictor,
+                  rbind(A1.mmd[2,],A2.mmd[2,]))
+
+INTERSECT<-R.S.mmd+R.G.mmd-R.SG.mmd
+R2.mmd<-c(R.rand.mmd,INTERSECT,R.S.mmd-INTERSECT,R.G.mmd-INTERSECT)
+names(R2.mmd)<-c("individual","both","social","genetic")
+VP.mmd<-calcVarPart(mmd.0)
+
+#####res
+DF.LR.mmm.IL_BC<-DF.LR.mmm
+DF.LR.mmd.IL_BC<-DF.LR.mmd
+R2.mmm.IL_BC<-R2.mmm
+R2.mmd.IL_BC<-R2.mmd
+VP.mmm.IL_BC<-VP.mmm
+VP.mmd.IL_BC<-VP.mmd
+
+
+##############################
+#JACCARD##################
+##############################
+
+######Caecum#############
+DATA<-CA.Jaccard.fin
+FILT<-!is.na(DATA$Genetic_dist)&!is.na(DATA$Social_dist)
+DATA<-DATA[FILT,]
+DATA<-DATA[DATA$Genetic_dist<0.5,]
+FILT<-DATA$vrh_Var1!=DATA$vrh_Var2
+FILT[is.na(FILT)]<-TRUE
+DATA<-DATA[FILT,]
+
+DATA$Social_dist.sq<-DATA$Social_dist^0.5
+DATA$Genetic_dist.sq<-DATA$Genetic_dist^0.5
+DATA$value.logit<-car::logit(DATA$value)
+
+DATA.mmm<-DATA[DATA$Species=="MMM",]
+DATA.mmd<-DATA[DATA$Species=="MMD",]
+
+VECT.mmm<-paste(DATA.mmm$Var1,DATA.mmm$Var2,sep=",")
+MAT.mmm<-lmerMultiMember::weights_from_vector(VECT.mmm)
+VECT.mmd<-paste(DATA.mmd$Var1,DATA.mmd$Var2,sep=",")
+MAT.mmd<-lmerMultiMember::weights_from_vector(VECT.mmd)
+
+###mmm###
+mmm.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+#soc
+mmm.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+#genet
+mmm.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+A1.mmm<-anova(mmm.0,mmm.1)
+A2.mmm<-anova(mmm.0,mmm.2)
+
+R.rand.mmm<-MuMIn::r.squaredGLMM(mmm.0)[2]
+R.SG.mmm<-MuMIn::r.squaredGLMM(mmm.0)[1]
+R.S.mmm<-MuMIn::r.squaredGLMM(mmm.2)[1]
+R.G.mmm<-MuMIn::r.squaredGLMM(mmm.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmm<-data.frame(Predictor,
+                  rbind(A1.mmm[2,],A2.mmm[2,]))
+
+INTERSECT<-R.S.mmm+R.G.mmm-R.SG.mmm
+R2.mmm<-c(R.rand.mmm,INTERSECT,R.S.mmm-INTERSECT,R.G.mmm-INTERSECT)
+names(R2.mmm)<-c("individual","both","social","genetic")
+VP.mmm<-calcVarPart(mmm.0)
+
+###mmd###
+mmd.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+#soc
+mmd.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+#genet
+mmd.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+A1.mmd<-anova(mmd.0,mmd.1)
+A2.mmd<-anova(mmd.0,mmd.2)
+
+R.rand.mmd<-MuMIn::r.squaredGLMM(mmd.0)[2]
+R.SG.mmd<-MuMIn::r.squaredGLMM(mmd.0)[1]
+R.S.mmd<-MuMIn::r.squaredGLMM(mmd.2)[1]
+R.G.mmd<-MuMIn::r.squaredGLMM(mmd.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmd<-data.frame(Predictor,
+                  rbind(A1.mmd[2,],A2.mmd[2,]))
+
+INTERSECT<-R.S.mmd+R.G.mmd-R.SG.mmd
+R2.mmd<-c(R.rand.mmd,INTERSECT,R.S.mmd-INTERSECT,R.G.mmd-INTERSECT)
+names(R2.mmd)<-c("individual","both","social","genetic")
+VP.mmd<-calcVarPart(mmd.0)
+
+#####res
+DF.LR.mmm.CA_JA<-DF.LR.mmm
+DF.LR.mmd.CA_JA<-DF.LR.mmd
+R2.mmm.CA_JA<-R2.mmm
+R2.mmd.CA_JA<-R2.mmd
+VP.mmm.CA_JA<-VP.mmm
+VP.mmd.CA_JA<-VP.mmd
+
+######Colon#############
+DATA<-CO.Jaccard.fin
+FILT<-!is.na(DATA$Genetic_dist)&!is.na(DATA$Social_dist)
+DATA<-DATA[FILT,]
+DATA<-DATA[DATA$Genetic_dist<0.5,]
+FILT<-DATA$vrh_Var1!=DATA$vrh_Var2
+FILT[is.na(FILT)]<-TRUE
+DATA<-DATA[FILT,]
+
+DATA$Social_dist.sq<-DATA$Social_dist^0.5
+DATA$Genetic_dist.sq<-DATA$Genetic_dist^0.5
+DATA$value.logit<-car::logit(DATA$value)
+
+DATA.mmm<-DATA[DATA$Species=="MMM",]
+DATA.mmd<-DATA[DATA$Species=="MMD",]
+
+VECT.mmm<-paste(DATA.mmm$Var1,DATA.mmm$Var2,sep=",")
+MAT.mmm<-lmerMultiMember::weights_from_vector(VECT.mmm)
+VECT.mmd<-paste(DATA.mmd$Var1,DATA.mmd$Var2,sep=",")
+MAT.mmd<-lmerMultiMember::weights_from_vector(VECT.mmd)
+
+###mmm###
+mmm.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+#soc
+mmm.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+#genet
+mmm.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+A1.mmm<-anova(mmm.0,mmm.1)
+A2.mmm<-anova(mmm.0,mmm.2)
+
+R.rand.mmm<-MuMIn::r.squaredGLMM(mmm.0)[2]
+R.SG.mmm<-MuMIn::r.squaredGLMM(mmm.0)[1]
+R.S.mmm<-MuMIn::r.squaredGLMM(mmm.2)[1]
+R.G.mmm<-MuMIn::r.squaredGLMM(mmm.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmm<-data.frame(Predictor,
+                  rbind(A1.mmm[2,],A2.mmm[2,]))
+
+INTERSECT<-R.S.mmm+R.G.mmm-R.SG.mmm
+R2.mmm<-c(R.rand.mmm,INTERSECT,R.S.mmm-INTERSECT,R.G.mmm-INTERSECT)
+names(R2.mmm)<-c("individual","both","social","genetic")
+VP.mmm<-calcVarPart(mmm.0)
+
+###mmd###
+mmd.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+#soc
+mmd.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+#genet
+mmd.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+A1.mmd<-anova(mmd.0,mmd.1)
+A2.mmd<-anova(mmd.0,mmd.2)
+
+R.rand.mmd<-MuMIn::r.squaredGLMM(mmd.0)[2]
+R.SG.mmd<-MuMIn::r.squaredGLMM(mmd.0)[1]
+R.S.mmd<-MuMIn::r.squaredGLMM(mmd.2)[1]
+R.G.mmd<-MuMIn::r.squaredGLMM(mmd.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmd<-data.frame(Predictor,
+                  rbind(A1.mmd[2,],A2.mmd[2,]))
+
+INTERSECT<-R.S.mmd+R.G.mmd-R.SG.mmd
+R2.mmd<-c(R.rand.mmd,INTERSECT,R.S.mmd-INTERSECT,R.G.mmd-INTERSECT)
+names(R2.mmd)<-c("individual","both","social","genetic")
+
+#####res
+DF.LR.mmm.CO_JA<-DF.LR.mmm
+DF.LR.mmd.CO_JA<-DF.LR.mmd
+R2.mmm.CO_JA<-R2.mmm
+R2.mmd.CO_JA<-R2.mmd
+VP.mmd<-calcVarPart(mmd.0)
+VP.mmm.CO_JA<-VP.mmm
+VP.mmd.CO_JA<-VP.mmd
+
+######Ileum#############
+DATA<-IL.Jaccard.fin
+FILT<-!is.na(DATA$Genetic_dist)&!is.na(DATA$Social_dist)
+DATA<-DATA[FILT,]
+DATA<-DATA[DATA$Genetic_dist<0.5,]
+FILT<-DATA$vrh_Var1!=DATA$vrh_Var2
+FILT[is.na(FILT)]<-TRUE
+DATA<-DATA[FILT,]
+DATA$Social_dist.sq<-DATA$Social_dist^0.5
+DATA$Genetic_dist.sq<-DATA$Genetic_dist^0.5
+DATA$value.logit<-car::logit(DATA$value)
+
+DATA.mmm<-DATA[DATA$Species=="MMM",]
+DATA.mmd<-DATA[DATA$Species=="MMD",]
+
+VECT.mmm<-paste(DATA.mmm$Var1,DATA.mmm$Var2,sep=",")
+MAT.mmm<-lmerMultiMember::weights_from_vector(VECT.mmm)
+VECT.mmd<-paste(DATA.mmd$Var1,DATA.mmd$Var2,sep=",")
+MAT.mmd<-lmerMultiMember::weights_from_vector(VECT.mmd)
+
+###mmm###
+mmm.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+#soc
+mmm.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+#genet
+mmm.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmm),
+             data = DATA.mmm)
+
+A1.mmm<-anova(mmm.0,mmm.1)
+A2.mmm<-anova(mmm.0,mmm.2)
+
+R.rand.mmm<-MuMIn::r.squaredGLMM(mmm.0)[2]
+R.SG.mmm<-MuMIn::r.squaredGLMM(mmm.0)[1]
+R.S.mmm<-MuMIn::r.squaredGLMM(mmm.2)[1]
+R.G.mmm<-MuMIn::r.squaredGLMM(mmm.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmm<-data.frame(Predictor,
+                  rbind(A1.mmm[2,],A2.mmm[2,]))
+
+INTERSECT<-R.S.mmm+R.G.mmm-R.SG.mmm
+R2.mmm<-c(R.rand.mmm,INTERSECT,R.S.mmm-INTERSECT,R.G.mmm-INTERSECT)
+names(R2.mmm)<-c("individual","both","social","genetic")
+VP.mmm<-calcVarPart(mmm.0)
+
+###mmd###
+mmd.0<-lmer(value.logit ~ Social_dist.sq+Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+#soc
+mmd.1<-lmer(value.logit ~ Genetic_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+#genet
+mmd.2<-lmer(value.logit ~ Social_dist.sq+
+               (1 | Var1), memberships = list(Var1 = MAT.mmd),
+             data = DATA.mmd)
+
+A1.mmd<-anova(mmd.0,mmd.1)
+A2.mmd<-anova(mmd.0,mmd.2)
+
+R.rand.mmd<-MuMIn::r.squaredGLMM(mmd.0)[2]
+R.SG.mmd<-MuMIn::r.squaredGLMM(mmd.0)[1]
+R.S.mmd<-MuMIn::r.squaredGLMM(mmd.2)[1]
+R.G.mmd<-MuMIn::r.squaredGLMM(mmd.1)[1]
+
+Predictor<-c("Social","Genetic")
+DF.LR.mmd<-data.frame(Predictor,
+                  rbind(A1.mmd[2,],A2.mmd[2,]))
+
+INTERSECT<-R.S.mmd+R.G.mmd-R.SG.mmd
+R2.mmd<-c(R.rand.mmd,INTERSECT,R.S.mmd-INTERSECT,R.G.mmd-INTERSECT)
+names(R2.mmd)<-c("individual","both","social","genetic")
+VP.mmd<-calcVarPart(mmd.0)
+
+#####res
+DF.LR.mmm.IL_JA<-DF.LR.mmm
+DF.LR.mmd.IL_JA<-DF.LR.mmd
+R2.mmm.IL_JA<-R2.mmm
+R2.mmd.IL_JA<-R2.mmd
+VP.mmm.IL_JA<-VP.mmm
+VP.mmd.IL_JA<-VP.mmd
+```
+
+# Tables and figures for models omiting closely related individuals
+
+```{r}
+###############################
+#LR table######################
+###############################
+
+DF.LR.all.JA<-rbind(DF.LR.mmd.CO_JA,
+DF.LR.mmm.CO_JA,
+DF.LR.mmd.CA_JA,
+DF.LR.mmm.CA_JA,
+DF.LR.mmd.IL_JA,
+DF.LR.mmm.IL_JA)
+
+DF.LR.all.BC<-rbind(DF.LR.mmd.CO_BC,
+DF.LR.mmm.CO_BC,
+DF.LR.mmd.CA_BC,
+DF.LR.mmm.CA_BC,
+DF.LR.mmd.IL_BC,
+DF.LR.mmm.IL_BC)
+
+names(DF.LR.all.JA)<-paste0(names(DF.LR.all.JA),"_JA")
+names(DF.LR.all.BC)<-paste0(names(DF.LR.all.BC),"_BC")
+
+DF.LR.all.BC.JC<-data.frame(DF.LR.all.BC[,c(1,8,7,9)],
+                            DF.LR.all.JA[,c(7,9)])
+
+DF.LR.all.BC.JC<-data.frame(gut_section=rep(c("colon","colon","caecum","caecum","ileum","ileum"),each=2),
+                            subspecies=rep(c("mmd","mmd","mmm","mmm"),3),
+                            DF.LR.all.BC.JC)
+
+write.table(DF.LR.all.BC.JC,
+            file = "~/data/Areny_social/RESULTS_revision/Multi_member_SepSpec_unrel.txt",
+            sep="\t",quote = F,row.names = F)
+
+##################################
+#var explained####################
+##################################
+
+EXPL<-rbind(
+VP.mmm.CA_BC,
+VP.mmd.CA_BC,
+VP.mmm.CO_BC,
+VP.mmd.CO_BC,
+VP.mmm.IL_BC,
+VP.mmd.IL_BC,
+VP.mmm.CA_JA,
+VP.mmd.CA_JA,
+VP.mmm.CO_JA,
+VP.mmd.CO_JA,
+VP.mmm.IL_JA,
+VP.mmd.IL_JA)
+
+
+SUMS<-rowSums(EXPL[,2:4])
+EXPL.x<-apply(EXPL,2,function(x) x/SUMS)  
+write.table(data.frame(Set=rownames(EXPL.x),EXPL.x), file = "~/data/Areny_social/RESULTS_revision/Var_expl_unrel.txt",
+            sep="\t",quote = F,row.names = F)
+
+EXPL.l<-melt(EXPL.x)
+EXPL.l$subspecies<-sapply(strsplit(as.character(EXPL.l$Var1), "[.]"), function(x) x[2], simplify=T)
+EXPL.l$gut_section<-sapply(strsplit(as.character(EXPL.l$Var1), "[.]"), function(x) x[3], simplify=T)
+EXPL.l$dissimilarity<-sapply(strsplit(as.character(EXPL.l$gut_section), "[_]"), function(x) x[2], simplify=T)
+EXPL.l$gut_section<-sapply(strsplit(as.character(EXPL.l$gut_section), "[_]"), function(x) x[1], simplify=T)
+
+EXPL.l$gut_section<-gsub("CO","Colon",EXPL.l$gut_section)
+EXPL.l$gut_section<-gsub("CA","Ceacum",EXPL.l$gut_section)
+EXPL.l$gut_section<-gsub("IL","Ileum",EXPL.l$gut_section)
+
+EXPL.l$dissimilarity<-gsub("JA","Jaccard",EXPL.l$dissimilarity)
+EXPL.l$dissimilarity<-gsub("BC","Bray-Curtis",EXPL.l$dissimilarity)
+EXPL.l.s<-EXPL.l[EXPL.l$Var2!="Var1",]
+EXPL.l.s<-EXPL.l.s[EXPL.l.s$Var2!="Residuals",]
+EXPL.l$Var2<-as.character(EXPL.l$Var2)
+EXPL.l.s$Var2<-ifelse(EXPL.l.s$Var2=="Social_dist.sq", "Social int.", "Relatedness")
+
+GG<-ggplot(data=EXPL.l.s,aes(y=value,x=subspecies,fill=Var2))+geom_bar(stat = "identity", position = "stack")+
+  facet_nested(dissimilarity~gut_section)
+
+GG.S<-small_fig(GG+theme_bw()) +  labs(y = "Variance explained", x = "subspecies")+theme(legend.title = element_blank(),
+                                                                                 legend.position = "bottom",
+                                                                                 strip.text = element_text(size=8))
+ggsave(GG.S,filename = "~/data/Areny_social/RESULTS_revision/LMER_Var_raw_corrected_unrel.pdf",
+       width = 8, height = 8, units = "cm")
+
+```
+
+
+# Extracting microbiota similarities between offsping and parents
+
+This chunk calculates (with the dist_to_parents function) the Jaccard and Bray Curtis similarity indices between all individuals. In the next step, the parent-offspring pairs are identified and extracted. This was done separately for all gut sections and for both beta diversity indices. 
+
+```{r}
+
+dist_to_parents<-function(PHYLO,DIST){
+  #####################
+  # Microbiota dissim##
+  #####################
+  PHYLO.rare<-rarefy_even_depth(PHYLO)
+  if(DIST=="BC"){DISSIM=as.matrix(1-vegdist(otu_table(PHYLO.rare)^0.5))}
+  if(DIST=="JA"){DISSIM=as.matrix(1-vegdist(data.frame(otu_table(PHYLO.rare)),method = "jaccard", binary=T))}
+  # DISSIM[upper.tri(DISSIM,diag = T)]<-NA
+  
+  SD<-data.frame(sample_data(PHYLO.rare))
+  
+  #similarities between mother and theri offspring
+  SD$Mother.up<-toupper(as.character(SD$Mother))
+  UN_mothers<-toupper(as.character(unique(SD$Mother.up)))
+  UN_mothers<-UN_mothers[!is.na(UN_mothers)]
+  
+  POC=1
+  SD.sub.list<-list()
+  for(i in 1:length(UN_mothers)){
+    TEST<-UN_mothers[i]%in%rownames(SD)
+    if(TEST==T){
+       SD.sub<-SD[SD$Mother.up==UN_mothers[i]&!is.na(SD$Mother),]
+       SD.sub$Microb<-DISSIM[rownames(SD.sub),UN_mothers[i]]
+       SD.sub.list[[POC]]<-SD.sub
+       POC=POC+1
+       }
+  }
+  
+  SD.sub.ALL<-do.call("rbind", SD.sub.list)
+  SD.sub.ALL_mothers<-SD.sub.ALL
+  
+  #similarities between fathers and theri offspring
+  SD$Father.up<-toupper(as.character(SD$Father))
+  UN_fathers<-toupper(as.character(unique(SD$Father.up)))
+  UN_fathers<-UN_fathers[!is.na(UN_fathers)]
+  
+  POC=1
+  SD.sub.list<-list()
+  for(i in 1:length(UN_fathers)){
+    TEST<-UN_fathers[i]%in%rownames(SD)
+    if(TEST==T){
+       SD.sub<-SD[SD$Father.up==UN_fathers[i]&!is.na(SD$Father),]
+       SD.sub$Microb<-DISSIM[rownames(SD.sub),UN_fathers[i]]
+       SD.sub.list[[POC]]<-SD.sub
+       POC=POC+1
+       }
+  }
+  
+  SD.sub.ALL<-do.call("rbind", SD.sub.list)
+  SD.sub.ALL_father<-SD.sub.ALL
+  
+  list(Mothers=SD.sub.ALL_mothers,Fathers=SD.sub.ALL_father)
+}  
+  
+
+Parents.CO_M_BC<-dist_to_parents(PHYLO = ARENY1618_CO_M, DIST = "BC") 
+Parents.CA_M_BC<-dist_to_parents(PHYLO = ARENY1618_CA_M, DIST = "BC") 
+Parents.IL_M_BC<-dist_to_parents(PHYLO = ARENY1618_IL_M, DIST = "BC") 
+
+Parents.CO_D_BC<-dist_to_parents(PHYLO = ARENY1618_CO_D, DIST = "BC") 
+Parents.CA_D_BC<-dist_to_parents(PHYLO = ARENY1618_CA_D, DIST = "BC") 
+Parents.IL_D_BC<-dist_to_parents(PHYLO = ARENY1618_IL_D, DIST = "BC") 
+  
+Parents.CO_M_JA<-dist_to_parents(PHYLO = ARENY1618_CO_M, DIST = "JA") 
+Parents.CA_M_JA<-dist_to_parents(PHYLO = ARENY1618_CA_M, DIST = "JA") 
+Parents.IL_M_JA<-dist_to_parents(PHYLO = ARENY1618_IL_M, DIST = "JA") 
+
+Parents.CO_D_JA<-dist_to_parents(PHYLO = ARENY1618_CO_D, DIST = "JA") 
+Parents.CA_D_JA<-dist_to_parents(PHYLO = ARENY1618_CA_D, DIST = "JA") 
+Parents.IL_D_JA<-dist_to_parents(PHYLO = ARENY1618_IL_D, DIST = "JA") 
+  
+
+#####MOTHERS###
+Mothers.BC<-rbind(Parents.CO_M_BC$Mothers,
+                  Parents.CA_M_BC$Mothers,
+                  Parents.IL_M_BC$Mothers,
+                  Parents.CO_D_BC$Mothers,
+                  Parents.CA_D_BC$Mothers,
+                  Parents.IL_D_BC$Mothers)
+
+Mothers.JA<-rbind(Parents.CO_M_JA$Mothers,
+                  Parents.CA_M_JA$Mothers,
+                  Parents.IL_M_JA$Mothers,
+                  Parents.CO_D_JA$Mothers,
+                  Parents.CA_D_JA$Mothers,
+                  Parents.IL_D_JA$Mothers)
+
+Fathers.BC<-rbind(Parents.CO_M_BC$Fathers,
+                  Parents.CA_M_BC$Fathers,
+                  Parents.IL_M_BC$Fathers,
+                  Parents.CO_D_BC$Fathers,
+                  Parents.CA_D_BC$Fathers,
+                  Parents.IL_D_BC$Fathers)
+
+Fathers.JA<-rbind(Parents.CO_M_JA$Fathers,
+                  Parents.CA_M_JA$Fathers,
+                  Parents.IL_M_JA$Fathers,
+                  Parents.CO_D_JA$Fathers,
+                  Parents.CA_D_JA$Fathers,
+                  Parents.IL_D_JA$Fathers)
+
+
+```
+# Baseline dissimilarity - unrelated individuals
+
+In this chunk the Merge_micro_gen_dissim function is used to extract microbiota similarities between "unrelated" (relatedness > 0.25) individuals. This is done separately for each gut section and each subspecies.
+In the next step, mixed models for estimating the overall intercept are fitted separately for the data of cecum, colon and ileum. The predictions of these models (and 95% confidence intervals) are used in the subsequent analyses as a baseline population-wide microbiota  similarity in the entire population.
+
+```{r}
+PHYLO<-ARENY1618_CO_M
+DIST="BC"
+GENETIC=mmm_matrix
+SUBSET=TRUE #odstrani NA...
+
+Merge_micro_gen_dissim<-function(PHYLO,DIST,GENETIC,SUBSET){ 
+  PHYLO.rare<-rarefy_even_depth(PHYLO)
+  if(DIST=="BC"){DISSIM=as.matrix(1-vegdist(otu_table(PHYLO.rare)^0.5))}
+  if(DIST=="JA"){DISSIM=as.matrix(1-vegdist(data.frame(otu_table(PHYLO.rare)),method = "jaccard", binary=T))}
+  DISSIM[upper.tri(DISSIM,diag = T)]<-NA
+  
+  DISSIM.l<-melt(DISSIM)
+  DISSIM.l$comb<-paste(DISSIM.l$Var1,DISSIM.l$Var2,sep="~")
+  
+  colnames(GENETIC)<-rownames(GENETIC)<-toupper(colnames(GENETIC))
+  GENETIC.l<-melt(GENETIC)
+  GENETIC.l$comb<-paste(GENETIC.l$Var1,GENETIC.l$Var2,sep="~")
+  names(GENETIC.l)[1:3]<-paste0(names(GENETIC.l)[1:3],"_gen")
+  
+  DISSIM.l<-join(DISSIM.l,GENETIC.l)
+  
+  SD<-data.frame(sample_data(PHYLO))
+  
+  SD$Var1<-sample_names(PHYLO.rare)
+
+  DISSIM.l<-join(DISSIM.l,SD)  
+  
+  if(SUBSET==T){FILT1<-is.na(DISSIM.l$value)
+                FILT2<-is.na(DISSIM.l$value_gen)
+                FILT12<-FILT1+FILT2==0
+                DISSIM.l<-DISSIM.l[FILT12,]}
+  
+  DISSIM.l
+}
+ 
+GM_CA_M_BC<-Merge_micro_gen_dissim(PHYLO=ARENY1618_CA_M,GENETIC=mmm_matrix,DIST = "BC",SUBSET=TRUE)
+GM_CO_M_BC<-Merge_micro_gen_dissim(PHYLO=ARENY1618_CO_M,GENETIC=mmm_matrix,DIST ="BC",SUBSET=TRUE)
+GM_IL_M_BC<-Merge_micro_gen_dissim(PHYLO=ARENY1618_IL_M,GENETIC=mmm_matrix,DIST ="BC",SUBSET=TRUE)
+
+GM_CA_D_BC<-Merge_micro_gen_dissim(PHYLO=ARENY1618_CA_D,GENETIC=mmd_matrix,DIST="BC",SUBSET=TRUE)
+GM_CO_D_BC<-Merge_micro_gen_dissim(PHYLO=ARENY1618_CO_D,GENETIC=mmd_matrix,DIST="BC",SUBSET=TRUE)
+GM_IL_D_BC<-Merge_micro_gen_dissim(PHYLO=ARENY1618_IL_D,GENETIC=mmd_matrix,DIST="BC",SUBSET=TRUE)
+
+GM_CA_M_JA<-Merge_micro_gen_dissim(PHYLO=ARENY1618_CA_M,GENETIC=mmm_matrix,DIST="JA",SUBSET=TRUE)
+GM_CO_M_JA<-Merge_micro_gen_dissim(PHYLO=ARENY1618_CO_M,GENETIC=mmm_matrix,DIST="JA",SUBSET=TRUE)
+GM_IL_M_JA<-Merge_micro_gen_dissim(PHYLO=ARENY1618_IL_M,GENETIC=mmm_matrix,DIST="JA",SUBSET=TRUE)
+
+GM_CA_D_JA<-Merge_micro_gen_dissim(PHYLO=ARENY1618_CA_D,GENETIC=mmd_matrix,DIST="JA",SUBSET=TRUE)
+GM_CO_D_JA<-Merge_micro_gen_dissim(PHYLO=ARENY1618_CO_D,GENETIC=mmd_matrix,DIST="JA",SUBSET=TRUE)
+GM_IL_D_JA<-Merge_micro_gen_dissim(PHYLO=ARENY1618_IL_D,GENETIC=mmd_matrix,DIST="JA",SUBSET=TRUE)
+
+###EXCLUDE RELATED#######
+GM_CA_M_BC.s<-GM_CA_M_BC[GM_CA_M_BC$value_gen<0.25,]
+GM_CO_M_BC.s<-GM_CO_M_BC[GM_CO_M_BC$value_gen<0.25,]
+GM_IL_M_BC.s<-GM_IL_M_BC[GM_IL_M_BC$value_gen<0.25,]
+
+GM_CA_D_BC.s<-GM_CA_D_BC[GM_CA_D_BC$value_gen<0.25,]
+GM_CO_D_BC.s<-GM_CO_D_BC[GM_CO_D_BC$value_gen<0.25,]
+GM_IL_D_BC.s<-GM_IL_D_BC[GM_IL_D_BC$value_gen<0.25,]
+
+GM_CA_M_JA.s<-GM_CA_M_JA[GM_CA_M_JA$value_gen<0.25,]
+GM_CO_M_JA.s<-GM_CO_M_JA[GM_CO_M_JA$value_gen<0.25,]
+GM_IL_M_JA.s<-GM_IL_M_JA[GM_IL_M_JA$value_gen<0.25,]
+
+GM_CA_D_JA.s<-GM_CA_D_JA[GM_CA_D_JA$value_gen<0.25,]
+GM_CO_D_JA.s<-GM_CO_D_JA[GM_CO_D_JA$value_gen<0.25,]
+GM_IL_D_JA.s<-GM_IL_D_JA[GM_IL_D_JA$value_gen<0.25,]
+
+#######MERGE###############
+GM_CA_MD_BC<-rbind(GM_CA_M_BC.s,GM_CA_D_BC.s)
+GM_CO_MD_BC<-rbind(GM_CO_M_BC.s,GM_CO_D_BC.s)
+GM_IL_MD_BC<-rbind(GM_IL_M_BC.s,GM_IL_D_BC.s)
+
+GM_CA_MD_JA<-rbind(GM_CA_M_JA.s,GM_CA_D_JA.s)
+GM_CO_MD_JA<-rbind(GM_CO_M_JA.s,GM_CO_D_JA.s)
+GM_IL_MD_JA<-rbind(GM_IL_M_JA.s,GM_IL_D_JA.s)
+
+GM_all_MD_BC<-rbind(GM_CA_MD_BC,GM_CO_MD_BC,GM_IL_MD_BC)
+GM_all_MD_JA<-rbind(GM_CA_MD_JA,GM_CO_MD_JA,GM_IL_MD_JA)
+
+############MODELS############
+DATA<-GM_CA_MD_BC
+DATA$value.logit<-car::logit(DATA$value)
+VECT<-paste(DATA$Var1,DATA$Var2,sep=",")
+MAT<-lmerMultiMember::weights_from_vector(VECT)
+mod<-lmer(value.logit ~ 1+(1 | Var1), memberships = list(Var1 = MAT), data = DATA)
+mod_GM_CA_MD_BC<-mod
+
+DATA<-GM_CO_MD_BC
+DATA$value.logit<-car::logit(DATA$value)
+VECT<-paste(DATA$Var1,DATA$Var2,sep=",")
+MAT<-lmerMultiMember::weights_from_vector(VECT)
+mod<-lmer(value.logit ~ 1+(1 | Var1), memberships = list(Var1 = MAT), data = DATA)
+mod_GM_CO_MD_BC<-mod
+
+DATA<-GM_IL_MD_BC
+DATA$value.logit<-car::logit(DATA$value)
+VECT<-paste(DATA$Var1,DATA$Var2,sep=",")
+MAT<-lmerMultiMember::weights_from_vector(VECT)
+mod<-lmer(value.logit ~ 1+(1 | Var1), memberships = list(Var1 = MAT), data = DATA)
+mod_GM_IL_MD_BC<-mod
+
+###
+DATA<-GM_CA_MD_JA
+DATA$value.logit<-car::logit(DATA$value)
+VECT<-paste(DATA$Var1,DATA$Var2,sep=",")
+MAT<-lmerMultiMember::weights_from_vector(VECT)
+mod<-lmer(value.logit ~ 1+(1 | Var1), memberships = list(Var1 = MAT), data = DATA)
+mod_GM_CA_MD_JA<-mod
+
+DATA<-GM_CO_MD_JA
+DATA$value.logit<-car::logit(DATA$value)
+VECT<-paste(DATA$Var1,DATA$Var2,sep=",")
+MAT<-lmerMultiMember::weights_from_vector(VECT)
+mod<-lmer(value.logit ~ 1+(1 | Var1), memberships = list(Var1 = MAT), data = DATA)
+mod_GM_CO_MD_JA<-mod
+
+DATA<-GM_IL_MD_JA
+DATA$value.logit<-car::logit(DATA$value)
+VECT<-paste(DATA$Var1,DATA$Var2,sep=",")
+MAT<-lmerMultiMember::weights_from_vector(VECT)
+mod<-lmer(value.logit ~ 1+(1 | Var1), memberships = list(Var1 = MAT), data = DATA)
+mod_GM_IL_MD_JA<-mod
+
+###
+
+DATA<-GM_all_MD_BC
+DATA$value.logit<-car::logit(DATA$value)
+VECT<-paste(DATA$Var1,DATA$Var2,sep=",")
+MAT<-lmerMultiMember::weights_from_vector(VECT)
+mod<-lmer(value.logit ~ 1+(1 | Var1), memberships = list(Var1 = MAT), data = DATA)
+mod_GM_all_MD_BC<-mod
+
+DATA<-GM_all_MD_JA
+DATA$value.logit<-car::logit(DATA$value)
+VECT<-paste(DATA$Var1,DATA$Var2,sep=",")
+MAT<-lmerMultiMember::weights_from_vector(VECT)
+mod<-lmer(value.logit ~ 1+(1 | Var1), memberships = list(Var1 = MAT), data = DATA)
+mod_GM_all_MD_JA<-mod
+
+
+
+
+```
+
+# Parent - offspring similarity (models)
+
+
+The main aim of these analyses is to test whether the similarity between offspring and mothers or fathers depends on age of offspring and whether the age-dependent trajectory differs between the gut sections, subspecies and between males vs. females. Therefore, data for all gut sections are used in a single model that accounts for interactions between age and gut section, subspecies or offspring sex. The variation of similarity with offspring age is modelled with a nonlinear bs() function. The complexity of the fit is tested in a first step. In the next step, the significance of the individual predictors is tested using the lmerTest::step() function.
+
+
+```{r}
+
+######################
+#BC MODELS MOTHERS####
+######################
+
+#df 4 nejlepsi
+DATA<-Mothers.BC
+levels(DATA$sex)[2]<-"F"
+DATA<-DATA[!is.na(DATA$age_estimate),]
+DATA$Microb.logit<-car::logit(DATA$Microb)
+
+m.lin<-lmer(Microb.logit ~ age_estimate+gut_section+subspecies_zkr+
+               age_estimate:gut_section+age_estimate:subspecies_zkr+
+               (1 | mouse_name)+(1|Mother),
+             data = DATA)
+m.pol2<-lmer(Microb.logit ~ ns(age_estimate,df=2)+gut_section+subspecies_zkr+
+               ns(age_estimate,df=2):gut_section+ ns(age_estimate,df=2):subspecies_zkr+
+               (1 | mouse_name)+(1|Mother),
+             data = DATA)
+m.pol3<-lmer(Microb.logit ~ ns(age_estimate,df=3)+gut_section+subspecies_zkr+
+               ns(age_estimate,df=3):gut_section+ ns(age_estimate,df=3):subspecies_zkr+
+               (1 | mouse_name)+(1|Mother),
+             data = DATA)
+m.pol4<-lmer(Microb.logit ~ ns(age_estimate,df=4)+gut_section+subspecies_zkr+
+               ns(age_estimate,df=4):gut_section+ ns(age_estimate,df=4):subspecies_zkr+
+               (1 | mouse_name)+(1|Mother),
+             data = DATA)
+m.pol5<-lmer(Microb.logit ~ ns(age_estimate,df=5)+gut_section+subspecies_zkr+
+               ns(age_estimate,df=5):gut_section+ns(age_estimate,df=5):subspecies_zkr+
+               (1 | mouse_name)+(1|Mother),
+             data = DATA)
+
+AIC.tab<-AIC(m.lin,m.pol2,m.pol3,m.pol4,m.pol5)
+AIC.tab<-data.frame(Model=c("linear","splines, df=2","splines, df=3","splines, df=4","splines, df=5"),
+                   AIC.tab)
+
+#LR tests
+m.pol4x<-lmer(Microb.logit ~ ns(age_estimate,df=4)+gut_section+subspecies_zkr+sex+
+               ns(age_estimate,df=4):gut_section+ns(age_estimate,df=4):subspecies_zkr+ns(age_estimate,df=4):sex+
+               (1 | mouse_name)+(1|Mother),
+             data = DATA)
+
+STEP<-step(m.pol4x,reduce.random=F)
+FINAL<-get_model(STEP)
+
+m.pol4c_mother.BC<-FINAL
+ANOVA.tab_mother.BC<-STEP
+AIC.tab_mother.BC<-AIC.tab
+
+######################
+#JA MODELS MOTHERS####
+######################
+DATA<-Mothers.JA
+levels(DATA$sex)[2]<-"F"
+DATA<-DATA[!is.na(DATA$age_estimate),]
+DATA$Microb.logit<-car::logit(DATA$Microb)
+
+
+m.lin<-lmer(Microb.logit ~ age_estimate+gut_section+subspecies_zkr+
+               age_estimate:gut_section+age_estimate:subspecies_zkr+
+               (1 | mouse_name)+(1|Mother),
+             data = DATA)
+
+m.lin<-lmer(Microb.logit ~ age_estimate+gut_section+subspecies_zkr+
+               age_estimate:gut_section+age_estimate:subspecies_zkr+
+               (1 | mouse_name)+(1|Mother),
+             data = DATA)
+m.pol2<-lmer(Microb.logit ~ ns(age_estimate,df=2)+gut_section+subspecies_zkr+
+               ns(age_estimate,df=2):gut_section+ns(age_estimate,df=2):subspecies_zkr+
+               (1 | mouse_name)+(1|Mother),
+             data = DATA)
+m.pol3<-lmer(Microb.logit ~ ns(age_estimate,df=3)+gut_section+subspecies_zkr+
+               ns(age_estimate,df=3):gut_section+ns(age_estimate,df=3):subspecies_zkr+
+               (1 | mouse_name)+(1|Mother),
+             data = DATA)
+m.pol4<-lmer(Microb.logit ~ ns(age_estimate,df=4)+gut_section+subspecies_zkr+
+               ns(age_estimate,df=4):gut_section+ns(age_estimate,df=4):subspecies_zkr+
+               (1 | mouse_name)+(1|Mother),
+             data = DATA)
+m.pol5<-lmer(Microb.logit ~ ns(age_estimate,df=5)+gut_section+subspecies_zkr+
+               ns(age_estimate,df=5):gut_section+ns(age_estimate,df=5):subspecies_zkr+
+               (1 | mouse_name)+(1|Mother),
+             data = DATA)
+
+AIC.tab<-AIC(m.lin,m.pol2,m.pol3,m.pol4,m.pol5)
+AIC.tab<-data.frame(Model=c("linear","splines, df=2","splines, df=3","splines, df=4","splines, df=5"),
+                   AIC.tab)
+
+#LR tests
+
+#FULL M
+m.pol4x<-lmer(Microb.logit ~ ns(age_estimate,df=4)+gut_section+subspecies_zkr+sex+
+               ns(age_estimate,df=4):gut_section+ns(age_estimate,df=4):subspecies_zkr+ns(age_estimate,df=4):sex+
+               (1 | mouse_name)+(1|Mother),
+             data = DATA)
+
+STEP<-step(m.pol4x,reduce.random=F)
+FINAL<-get_model(STEP)
+
+m.pol4c_mother.JA<-FINAL
+ANOVA.tab_mother.JA<-STEP
+AIC.tab_mother.JA<-AIC.tab
+
+
+######################
+#BC MODELS FATHERS####
+######################
+DATA<-Fathers.BC
+levels(DATA$sex)[2]<-"F"
+DATA<-DATA[!is.na(DATA$age_estimate),]
+DATA$Microb.logit<-car::logit(DATA$Microb)
+
+m.lin<-lmer(Microb.logit ~ age_estimate+gut_section+subspecies_zkr+
+               age_estimate:gut_section+age_estimate:subspecies_zkr+
+               (1 | mouse_name)+(1|Father),
+             data = DATA)
+m.pol2<-lmer(Microb.logit ~ ns(age_estimate,df=2)+gut_section+subspecies_zkr+
+               ns(age_estimate,df=2):gut_section+ns(age_estimate,df=2):subspecies_zkr+
+               (1 | mouse_name)+(1|Father),
+             data = DATA)
+m.pol3<-lmer(Microb.logit ~ ns(age_estimate,df=3)+gut_section+subspecies_zkr+
+               ns(age_estimate,df=3):gut_section+ns(age_estimate,df=3):subspecies_zkr+
+               (1 | mouse_name)+(1|Father),
+             data = DATA)
+m.pol4<-lmer(Microb.logit ~ ns(age_estimate,df=4)+gut_section+subspecies_zkr+
+               ns(age_estimate,df=4):gut_section+ns(age_estimate,df=4):subspecies_zkr+
+               (1 | mouse_name)+(1|Father),
+             data = DATA)
+m.pol5<-lmer(Microb.logit ~ ns(age_estimate,df=5)+gut_section+subspecies_zkr+
+               ns(age_estimate,df=5):gut_section+ns(age_estimate,df=5):subspecies_zkr+
+               (1 | mouse_name)+(1|Father),
+             data = DATA)
+
+AIC.tab<-AIC(m.lin,m.pol2,m.pol3,m.pol4,m.pol5)
+AIC.tab<-data.frame(Model=c("linear","splines, df=2","splines, df=3","splines, df=4","splines, df=5"),
+                   AIC.tab)
+
+#LR tests
+
+#FULL M
+m.pol4x<-lmer(Microb.logit ~ ns(age_estimate,df=3)+gut_section+subspecies_zkr+sex+
+               ns(age_estimate,df=2):gut_section+ns(age_estimate,df=3):subspecies_zkr+ns(age_estimate,df=3):sex+
+               (1 | mouse_name)+(1|Father),
+             data = DATA)
+
+STEP<-step(m.pol4x,reduce.random=F)
+FINAL<-get_model(STEP)
+
+m.pol4c_father.BC<-FINAL
+ANOVA.tab_father.BC<-STEP
+AIC.tab_father.BC<-AIC.tab
+
+
+######################
+#JA MODELS FATHERS####
+######################
+DATA<-Fathers.JA
+DATA<-DATA[!is.na(DATA$age_estimate),]
+DATA$Microb.logit<-car::logit(DATA$Microb)
+
+m.lin<-lmer(Microb.logit ~ age_estimate+gut_section+subspecies_zkr+
+               age_estimate:gut_section+age_estimate:subspecies_zkr+
+               (1 | mouse_name)+(1|Father),
+             data = DATA)
+m.pol2<-lmer(Microb.logit ~ ns(age_estimate,df=2)+gut_section+subspecies_zkr+
+               ns(age_estimate,df=2):gut_section+ns(age_estimate,df=2):subspecies_zkr+
+               (1 | mouse_name)+(1|Father),
+             data = DATA)
+m.pol3<-lmer(Microb.logit ~ ns(age_estimate,df=3)+gut_section+subspecies_zkr+
+               ns(age_estimate,df=3):gut_section+ns(age_estimate,df=3):subspecies_zkr+
+               (1 | mouse_name)+(1|Father),
+             data = DATA)
+m.pol4<-lmer(Microb.logit ~ ns(age_estimate,df=4)+gut_section+subspecies_zkr+
+               ns(age_estimate,df=4):gut_section+ns(age_estimate,df=4):subspecies_zkr+
+               (1 | mouse_name)+(1|Father),
+             data = DATA)
+m.pol5<-lmer(Microb.logit ~ ns(age_estimate,df=5)+gut_section+subspecies_zkr+
+               ns(age_estimate,df=5):gut_section+ns(age_estimate,df=5):subspecies_zkr+
+               (1 | mouse_name)+(1|Father),
+             data = DATA)
+
+AIC.tab<-AIC(m.lin,m.pol2,m.pol3,m.pol4,m.pol5)
+AIC.tab<-data.frame(Model=c("linear","splines, df=2","splines, df=3","splines, df=4","splines, df=5"),
+                   AIC.tab)
+
+#LR tests
+
+#FULL M
+m.pol4x<-lmer(Microb.logit ~ ns(age_estimate,df=3)+gut_section+subspecies_zkr+sex+
+               ns(age_estimate,df=2):gut_section+ns(age_estimate,df=3):subspecies_zkr+ns(age_estimate,df=3):sex+
+               (1 | mouse_name)+(1|Father),
+             data = DATA)
+
+STEP<-step(m.pol4x,reduce.random=F)
+FINAL<-get_model(STEP)
+
+m.pol4c_father.JA<-FINAL
+ANOVA.tab_father.JA<-STEP
+AIC.tab_father.JA<-AIC.tab
+
+```
+
+# Results
+
+In this part, tables are created with the results of the above analyses
+
+```{r fig.height=20,fig.width=12}
+
+ANOVA.tab_mother.BCx<-ANOVA.tab_mother.BC$fixed
+ANOVA.tab_mother.JAx<-ANOVA.tab_mother.JA$fixed
+ANOVA.tab_father.BCx<-ANOVA.tab_father.BC$fixed
+ANOVA.tab_father.JAx<-ANOVA.tab_father.JA$fixed
+
+Predictor<-c(rownames(ANOVA.tab_mother.BC$fixed),
+             rownames(ANOVA.tab_mother.JA$fixed),
+             rownames(ANOVA.tab_father.BC$fixed),
+             rownames(ANOVA.tab_father.JA$fixed))
+
+ANOVA.tab_mother.BCx<-data.frame(Disimilarity="Bray-Curtis",Comparission="Mother-offspring",ANOVA.tab_mother.BCx)
+ANOVA.tab_mother.JAx<-data.frame(Disimilarity="Jaccard",Comparission="Mother-offspring",ANOVA.tab_mother.JAx)
+ANOVA.tab_father.BCx<-data.frame(Disimilarity="Bray-Curtis",Comparission="Father-offspring",ANOVA.tab_father.BCx)
+ANOVA.tab_father.JAx<-data.frame(Disimilarity="Jaccard",Comparission="Father-offspring",ANOVA.tab_father.JAx)
+
+ANOVA.tab.all<-rbind(ANOVA.tab_mother.BCx,
+                     ANOVA.tab_mother.JAx,
+                     ANOVA.tab_father.BCx,
+                     ANOVA.tab_father.JAx)
+ANOVA.tab.all<-data.frame(ANOVA.tab.all,Predictor)
+
+ANOVA.tab.all<-ANOVA.tab.all[,c(1,2,10,6:9)]
+
+ANOVA.tab.parents<-ANOVA.tab.all
+write.table(ANOVA.tab.parents,file = "~/data/Areny_social/RESULTS_revision/ANOVA_parents_SEX.txt",sep="\t",row.names = F,quote = F)
+
+AIC.tab.all<-rbind(AIC.tab_mother.BC,AIC.tab_mother.JA,AIC.tab_father.BC,AIC.tab_father.JA)
+Comparission<-rep(c("Mother-offspring", "Father-offspring"),each=dim(AIC.tab_father.BC)[1]*2)
+Disimilarity<-rep(c("Bray-Curtis", "Jaccard","Bray-Curtis", "Jaccard"),each=dim(AIC.tab_mother.BC)[1])
+AIC.tab.parents<-data.frame(Comparission,Disimilarity,AIC.tab.all)
+write.table(AIC.tab.parents,file = "~/data/Areny_social/RESULTS_revision/AIC.tab.all_SEX.txt",sep="\t",row.names = F,quote = F)
+
+
+```
+
+
+# Maternal/paternal predictions for each gut section
+Based on the above analyses, the interaction between gut section and offspring age was highly significant. Therefore, we created a separate model for each gut section and plotted the predictions of these models.
+
+```{r, warning=F,message=F}
+PLOT_PRED.fnc<-function(MODEL,DATA,BASELINE,COLOR){
+
+  pred<-ggpredict(MODEL,terms = c("age_estimate"),ci.lvl = 0.95,interval = "confidence")
+  GG<-ggplot(pred, aes(x = x, y = predicted))+geom_line(color=COLOR) + geom_ribbon( aes(ymin = conf.low, ymax = conf.high),fill=COLOR,alpha=0.2)
+  GG<-GG+geom_point(data=DATA,aes(x=age_estimate,y=Microb.logit),color=COLOR,alpha=0.5,size=1)
+
+  SSS<-summary(BASELINE)
+  MEAN<-SSS$coefficients[,1]
+  LCI<-MEAN-1.98*SSS$coefficients[,2]
+  HCI<-MEAN+1.98*SSS$coefficients[,2]
+
+  GG+geom_abline(intercept=MEAN,slope=0,color="gray50",linetype = "dashed")
+  GG<-append_layers(GG,geom_segment(aes(x=min(as.numeric(DATA$age_estimate)),xend=max(as.numeric(DATA$age_estimate)),
+                                      y=MEAN,yend=MEAN),color="gray50",linetype = "dashed"), position = "bottom")
+  GG<-append_layers(GG,geom_ribbon(aes(ymin = LCI, ymax = HCI), fill = "grey90",colour=NA), position = "bottom")
+  GG
+}
+
+######################
+#BC MODELS MOTHERS####
+######################
+
+DATA<-Mothers.BC
+DATA<-DATA[!is.na(DATA$age_estimate),]
+DATA$Microb.logit<-car::logit(DATA$Microb)
+DATA.CA<-DATA[DATA$gut_section=="Caecum",]
+DATA.CO<-DATA[DATA$gut_section=="Colon",]
+DATA.IL<-DATA[DATA$gut_section=="Ileum",]
+
+m.2<-lmer(Microb.logit ~ ns(age_estimate,df=2)+(1|Mother),data = DATA.CA)
+m.3<-lmer(Microb.logit ~ ns(age_estimate,df=3)+(1|Mother),data = DATA.CA)
+m.4<-lmer(Microb.logit ~ ns(age_estimate,df=4)+(1|Mother),data = DATA.CA)
+AIC(m.2,m.3,m.4)
+m.CA<-m.4
+
+m.2<-lmer(Microb.logit ~ ns(age_estimate,df=2)+(1|Mother),data = DATA.CO)
+m.3<-lmer(Microb.logit ~ ns(age_estimate,df=3)+(1|Mother),data = DATA.CO)
+m.4<-lmer(Microb.logit ~ ns(age_estimate,df=4)+(1|Mother),data = DATA.CO)
+AIC(m.2,m.3,m.4)
+m.CO<-m.4
+
+m.2<-lmer(Microb.logit ~ ns(age_estimate,df=2)+(1|Mother),data = DATA.IL)
+m.3<-lmer(Microb.logit ~ ns(age_estimate,df=3)+(1|Mother),data = DATA.IL)
+m.4<-lmer(Microb.logit ~ ns(age_estimate,df=4)+(1|Mother),data = DATA.IL)
+AIC(m.2,m.3,m.4)
+m.IL<-m.4
+
+
+pred_GM_CO_MD_BC<-PLOT_PRED.fnc(MODEL=m.CO,DATA=DATA.CO,BASELINE=mod_GM_CO_MD_BC,COLOR="blue")+theme_bw()
+pred_GM_CA_MD_BC<-PLOT_PRED.fnc(MODEL=m.CA,DATA=DATA.CA,BASELINE=mod_GM_CA_MD_BC,COLOR="red")+theme_bw()
+pred_GM_IL_MD_BC<-PLOT_PRED.fnc(MODEL=m.IL,DATA=DATA.IL,BASELINE=mod_GM_IL_MD_BC,COLOR="green")+theme_bw()
+
+
+######################
+#JA MODELS MOTHERS####
+######################
+
+DATA<-Mothers.JA
+DATA<-DATA[!is.na(DATA$age_estimate),]
+DATA$Microb.logit<-car::logit(DATA$Microb)
+DATA.CA<-DATA[DATA$gut_section=="Caecum",]
+DATA.CO<-DATA[DATA$gut_section=="Colon",]
+DATA.IL<-DATA[DATA$gut_section=="Ileum",]
+
+m.2<-lmer(Microb.logit ~ ns(age_estimate,df=2)+(1|Mother),data = DATA.CA)
+m.3<-lmer(Microb.logit ~ ns(age_estimate,df=3)+(1|Mother),data = DATA.CA)
+m.4<-lmer(Microb.logit ~ ns(age_estimate,df=4)+(1|Mother),data = DATA.CA)
+AIC(m.2,m.3,m.4)
+m.CA<-m.4
+
+m.2<-lmer(Microb.logit ~ ns(age_estimate,df=2)+(1|Mother),data = DATA.CO)
+m.3<-lmer(Microb.logit ~ ns(age_estimate,df=3)+(1|Mother),data = DATA.CO)
+m.4<-lmer(Microb.logit ~ ns(age_estimate,df=4)+(1|Mother),data = DATA.CO)
+AIC(m.2,m.3,m.4)
+m.CO<-m.4
+
+m.2<-lmer(Microb.logit ~ ns(age_estimate,df=2)+(1|Mother),data = DATA.IL)
+m.3<-lmer(Microb.logit ~ ns(age_estimate,df=3)+(1|Mother),data = DATA.IL)
+m.4<-lmer(Microb.logit ~ ns(age_estimate,df=4)+(1|Mother),data = DATA.IL)
+AIC(m.2,m.3,m.4)
+m.IL<-m.4
+
+
+pred_GM_CO_MD_JA<-PLOT_PRED.fnc(MODEL=m.CO,DATA=DATA.CO,BASELINE=mod_GM_CO_MD_JA,COLOR="blue")+theme_bw()
+pred_GM_CA_MD_JA<-PLOT_PRED.fnc(MODEL=m.CA,DATA=DATA.CA,BASELINE=mod_GM_CA_MD_JA,COLOR="red")+theme_bw()
+pred_GM_IL_MD_JA<-PLOT_PRED.fnc(MODEL=m.IL,DATA=DATA.IL,BASELINE=mod_GM_IL_MD_JA,COLOR="green")+theme_bw()
+
+
+######################
+#BC MODELS FATHER#####
+######################
+
+DATA<-Fathers.BC
+DATA<-DATA[!is.na(DATA$age_estimate),]
+DATA$Microb.logit<-car::logit(DATA$Microb)
+DATA.CA<-DATA[DATA$gut_section=="Caecum",]
+DATA.CO<-DATA[DATA$gut_section=="Colon",]
+DATA.IL<-DATA[DATA$gut_section=="Ileum",]
+
+m.2<-lmer(Microb.logit ~ ns(age_estimate,df=2)+(1|Father),data = DATA.CA)
+m.3<-lmer(Microb.logit ~ ns(age_estimate,df=3)+(1|Father),data = DATA.CA)
+m.4<-lmer(Microb.logit ~ ns(age_estimate,df=4)+(1|Father),data = DATA.CA)
+AIC(m.2,m.3,m.4)
+m.CA<-m.3
+
+m.2<-lmer(Microb.logit ~ ns(age_estimate,df=2)+(1|Father),data = DATA.CO)
+m.3<-lmer(Microb.logit ~ ns(age_estimate,df=3)+(1|Father),data = DATA.CO)
+m.4<-lmer(Microb.logit ~ ns(age_estimate,df=4)+(1|Father),data = DATA.CO)
+AIC(m.2,m.3,m.4)
+m.CO<-m.3
+
+m.2<-lmer(Microb.logit ~ ns(age_estimate,df=2)+(1|Father),data = DATA.IL)
+m.3<-lmer(Microb.logit ~ ns(age_estimate,df=3)+(1|Father),data = DATA.IL)
+m.4<-lmer(Microb.logit ~ ns(age_estimate,df=4)+(1|Father),data = DATA.IL)
+AIC(m.2,m.3,m.4)
+m.IL<-m.3
+
+
+pred_GM_CO_FD_BC<-PLOT_PRED.fnc(MODEL=m.CO,DATA=DATA.CO,BASELINE=mod_GM_CO_MD_BC,COLOR="blue")+theme_bw()
+pred_GM_CA_FD_BC<-PLOT_PRED.fnc(MODEL=m.CA,DATA=DATA.CA,BASELINE=mod_GM_CA_MD_BC,COLOR="red")+theme_bw()
+pred_GM_IL_FD_BC<-PLOT_PRED.fnc(MODEL=m.IL,DATA=DATA.IL,BASELINE=mod_GM_IL_MD_BC,COLOR="green")+theme_bw()
+
+
+######################
+#JA MODELS FATHER#####
+######################
+
+DATA<-Fathers.JA
+DATA<-DATA[!is.na(DATA$age_estimate),]
+DATA$Microb.logit<-car::logit(DATA$Microb)
+DATA.CA<-DATA[DATA$gut_section=="Caecum",]
+DATA.CO<-DATA[DATA$gut_section=="Colon",]
+DATA.IL<-DATA[DATA$gut_section=="Ileum",]
+
+m.2<-lmer(Microb.logit ~ ns(age_estimate,df=2)+(1|Father),data = DATA.CA)
+m.3<-lmer(Microb.logit ~ ns(age_estimate,df=3)+(1|Father),data = DATA.CA)
+m.4<-lmer(Microb.logit ~ ns(age_estimate,df=4)+(1|Father),data = DATA.CA)
+AIC(m.2,m.3,m.4)
+m.CA<-m.3
+
+m.2<-lmer(Microb.logit ~ ns(age_estimate,df=2)+(1|Father),data = DATA.CO)
+m.3<-lmer(Microb.logit ~ ns(age_estimate,df=3)+(1|Father),data = DATA.CO)
+m.4<-lmer(Microb.logit ~ ns(age_estimate,df=4)+(1|Father),data = DATA.CO)
+AIC(m.2,m.3,m.4)
+m.CO<-m.3
+
+m.2<-lmer(Microb.logit ~ ns(age_estimate,df=2)+(1|Father),data = DATA.IL)
+m.3<-lmer(Microb.logit ~ ns(age_estimate,df=3)+(1|Father),data = DATA.IL)
+m.4<-lmer(Microb.logit ~ ns(age_estimate,df=4)+(1|Father),data = DATA.IL)
+AIC(m.2,m.3,m.4)
+m.IL<-m.3
+
+
+pred_GM_CO_FD_JA<-PLOT_PRED.fnc(MODEL=m.CO,DATA=DATA.CO,BASELINE=mod_GM_CO_MD_JA,COLOR="blue")+theme_bw()
+pred_GM_CA_FD_JA<-PLOT_PRED.fnc(MODEL=m.CA,DATA=DATA.CA,BASELINE=mod_GM_CA_MD_JA,COLOR="red")+theme_bw()
+pred_GM_IL_FD_JA<-PLOT_PRED.fnc(MODEL=m.IL,DATA=DATA.IL,BASELINE=mod_GM_IL_MD_JA,COLOR="green")+theme_bw()
+
+
+###########################
+#BRAY-Curtis plots#########
+###########################
+
+pred_GM_CO_MD_BC.s<-small_fig(pred_GM_CO_MD_BC)+xlab("Age (days)")+ylab("Mother-offspring similarity\nlogit transformed")
+pred_GM_CA_MD_BC.s<-small_fig(pred_GM_CA_MD_BC)+xlab("Age (days)")+ylab("Mother-offspring similarity\nlogit transformed")
+pred_GM_IL_MD_BC.s<-small_fig(pred_GM_IL_MD_BC)+xlab("Age (days)")+ylab("Mother-offspring similarity\nlogit transformed")
+
+pred_GM_CO_MD_JA.s<-small_fig(pred_GM_CO_MD_JA)+xlab("Age (days)")+ylab("Mother-offspring similarity\nlogit transformed")
+pred_GM_CA_MD_JA.s<-small_fig(pred_GM_CA_MD_JA)+xlab("Age (days)")+ylab("Mother-offspring similarity\nlogit transformed")
+pred_GM_IL_MD_JA.s<-small_fig(pred_GM_IL_MD_JA)+xlab("Age (days)")+ylab("Mother-offspring similarity\nlogit transformed")
+
+
+
+pred_GM_CO_FD_BC.s<-small_fig(pred_GM_CO_FD_BC)+xlab("Age (days)")+ylab("Father-offspring similarity\nlogit transformed")
+pred_GM_CA_FD_BC.s<-small_fig(pred_GM_CA_FD_BC)+xlab("Age (days)")+ylab("Father-offspring similarity\nlogit transformed")
+pred_GM_IL_FD_BC.s<-small_fig(pred_GM_IL_FD_BC)+xlab("Age (days)")+ylab("Father-offspring similarity\nlogit transformed")
+
+pred_GM_CO_FD_JA.s<-small_fig(pred_GM_CO_FD_JA)+xlab("Age (days)")+ylab("Father-offspring similarity\nlogit transformed")
+pred_GM_CA_FD_JA.s<-small_fig(pred_GM_CA_FD_JA)+xlab("Age (days)")+ylab("Father-offspring similarity\nlogit transformed")
+pred_GM_IL_FD_JA.s<-small_fig(pred_GM_IL_FD_JA)+xlab("Age (days)")+ylab("Father-offspring similarity\nlogit transformed")
+
+
+GRID.BC<-ggarrange(pred_GM_IL_MD_BC.s+ggtitle("A) Ileum (Mothers)"),
+                   pred_GM_CA_MD_BC.s+ggtitle("B) Caecum (Mothers)"),
+          pred_GM_CO_MD_BC.s+ggtitle("C) Colon (Mothers)"),
+          pred_GM_IL_FD_BC.s+ggtitle("D) Ileum (Fathers)"),
+          pred_GM_CA_FD_BC.s+ggtitle("E) Caecum (Fathers)"),
+          pred_GM_CO_FD_BC.s+ggtitle("F) Colon (Fathers)"),
+          ncol = 3,nrow = 2)
+
+GRID.JA<-ggarrange(pred_GM_IL_MD_JA.s+ggtitle("A) Ileum (Mothers)"),
+                   pred_GM_CA_MD_JA.s+ggtitle("B) Caecum (Mothers)"),
+          pred_GM_CO_MD_JA.s+ggtitle("C) Colon (Mothers)"),
+          pred_GM_IL_FD_JA.s+ggtitle("D) Ileum (Fathers)"),
+          pred_GM_CA_FD_JA.s+ggtitle("E) Caecum (Fathers)"),
+          pred_GM_CO_FD_JA.s+ggtitle("F) Colon (Fathers)"),
+          ncol = 3,nrow = 2)
+
+ggsave(GRID.BC,filename = "~/data/Areny_social/RESULTS_revision/Parent_offspring_disimilarity.BC_v2.pdf",width = 18, height = 12, units="cm")
+ggsave(GRID.JA,filename = "~/data/Areny_social/RESULTS_revision/Parent_offspring_disimilarity.JA_v2.pdf",width = 18, height = 12, units="cm")
+
+GRID.JA
+GRID.BC
+
+```
+
+# Mother-offspring similarity (additional analyses)
+
+In this section, predictions were made for the interactions between subspecies and age of offspring and for the interaction between age and sex of offspring.
+
+```{r, warning=F,message=F,fig.width=15}
+library(glmmTMB)
+
+
+####Mother-offspring, effect of subspecies (Bray-Curtis)###########
+
+DATA<-Mothers.BC
+DATA<-DATA[!is.na(DATA$age_estimate),]
+DATA$Microb.logit<-car::logit(DATA$Microb)
+DATA$gut_section<-factor(DATA$gut_section, levels=c("Ileum","Colon","Caecum"))
+
+
+m.2<-glmmTMB(Microb.logit ~ ns(age_estimate, df = 4)*gut_section+ns(age_estimate,df=4)*subspecies_zkr+(1|Mother),data = DATA)
+
+pred<-ggpredict(m.2,terms = c("age_estimate","subspecies_zkr"),ci.lvl = 0.95,interval = "confidence")
+PLOT<-plot(pred, residuals = T)
+D.p<-PLOT$data
+D.a<-attr(PLOT$data,"residual_data")
+D.a$gut_section<-DATA$gut_section
+GG<-ggplot(D.p, aes(x = x, y = predicted,fill=group,color=group))+geom_line() +
+  geom_ribbon( aes(ymin = conf.low, ymax = conf.high,color=NULL),alpha=0.2)+
+  geom_point(data=D.a,aes(x=x,y=predicted,color=group,shape=gut_section),alpha=0.3)
+GG
+
+
+GG.s<-small_fig(GG+theme_bw())
+GG.s<-GG.s+labs(shape=NULL, colour=NULL,fill=NULL)+xlab("Age (days)")+
+  ylab("Mother-offsping similarity\n(Bray-Curtis, logit transformed)")+
+  theme(legend.position = "bottom", legend.box="vertical", legend.margin=margin())
+ggsave(GG.s,filename = "~/data/Areny_social/RESULTS_23/Similarity_species.pdf",
+       width = 10,height = 10, units = "cm")
+GG.s
+GG.s.BC.species<-GG.s
+
+####Mother-offspring, effect of subspecies (Jaccard)###########
+
+DATA<-Mothers.JA
+DATA<-DATA[!is.na(DATA$age_estimate),]
+DATA$Microb.logit<-car::logit(DATA$Microb)
+DATA$gut_section<-factor(DATA$gut_section, levels=c("Ileum","Colon","Caecum"))
+
+
+m.2<-glmmTMB(Microb.logit ~ ns(age_estimate, df = 4)*gut_section+ns(age_estimate,df=4)*subspecies_zkr+(1|Mother),data = DATA)
+
+pred<-ggpredict(m.2,terms = c("age_estimate","subspecies_zkr"),ci.lvl = 0.95,interval = "confidence")
+PLOT<-plot(pred, residuals = T)
+D.p<-PLOT$data
+D.a<-attr(PLOT$data,"residual_data")
+D.a$gut_section<-DATA$gut_section
+GG<-ggplot(D.p, aes(x = x, y = predicted,fill=group,color=group))+geom_line() +
+  geom_ribbon( aes(ymin = conf.low, ymax = conf.high,color=NULL),alpha=0.2)+
+  geom_point(data=D.a,aes(x=x,y=predicted,color=group,shape=gut_section),alpha=0.3)
+GG
+
+GG.s<-small_fig(GG+theme_bw())
+GG.s<-GG.s+labs(shape=NULL, colour=NULL,fill=NULL)+xlab("Age (days)")+
+  ylab("Mother-offsping similarity\n(Bray-Curtis, logit transformed)")+
+  theme(legend.position = "bottom", legend.box="vertical", legend.margin=margin())
+ggsave(GG.s,filename = "~/data/Areny_social/RESULTS_23/Similarity_species.pdf",
+       width = 10,height = 10, units = "cm")
+GG.s
+GG.s.JA.species<-GG.s
+
+
+#####
+####Mother-offspring, effect of sex (Bray-Curtis)###########
+
+DATA<-Mothers.BC
+DATA$sex<-as.factor(DATA$sex)
+levels(DATA$sex)[2]<-"F"
+DATA<-DATA[!is.na(DATA$age_estimate),]
+DATA$Microb.logit<-car::logit(DATA$Microb)
+DATA$gut_section<-factor(DATA$gut_section, levels=c("Ileum","Colon","Caecum"))
+
+m.2<-lmer(Microb.logit ~ ns(age_estimate, df = 4)*gut_section+ns(age_estimate,df=4)*sex+(1|Mother),data = DATA)
+
+pred<-ggpredict(m.2,terms = c("age_estimate","sex"),ci.lvl = 0.95,interval = "confidence")
+PLOT<-plot(pred, residuals = T)
+D.p<-PLOT$data
+D.a<-attr(PLOT$data,"residual_data")
+D.a$gut_section<-DATA$gut_section
+GG<-ggplot(D.p, aes(x = x, y = predicted,fill=group,color=group))+geom_line() +
+  geom_ribbon( aes(ymin = conf.low, ymax = conf.high,color=NULL),alpha=0.2)+
+  geom_point(data=D.a,aes(x=x,y=predicted,color=group,shape=gut_section),alpha=0.3)
+GG
+
+
+GG.s<-small_fig(GG+theme_bw())
+GG.s<-GG.s+labs(shape=NULL, colour=NULL,fill=NULL)+xlab("Age (days)")+
+  ylab("Mother-offsping similarity\n(Bray-Curtis, logit transformed)")+
+  theme(legend.position = "bottom", legend.box="vertical", legend.margin=margin())
+ggsave(GG.s,filename = "~/data/Areny_social/RESULTS_23/Similarity_species.pdf",
+       width = 10,height = 10, units = "cm")
+GG.s
+GG.s.BC.sex<-GG.s
+
+####Mother-offspring, effect of subspecies (Jaccasrd)###########
+
+DATA<-Mothers.JA
+DATA$sex<-as.factor(DATA$sex)
+levels(DATA$sex)[2]<-"F"
+DATA<-DATA[!is.na(DATA$age_estimate),]
+DATA$Microb.logit<-car::logit(DATA$Microb)
+DATA$gut_section<-factor(DATA$gut_section, levels=c("Ileum","Colon","Caecum"))
+
+m.2<-glmmTMB(Microb.logit ~ ns(age_estimate, df = 4)*gut_section+ns(age_estimate,df=4)*sex+(1|Mother),data = DATA)
+
+pred<-ggpredict(m.2,terms = c("age_estimate","sex"),ci.lvl = 0.95,interval = "confidence")
+PLOT<-plot(pred, residuals = T)
+D.p<-PLOT$data
+D.a<-attr(PLOT$data,"residual_data")
+D.a$gut_section<-DATA$gut_section
+GG<-ggplot(D.p, aes(x = x, y = predicted,fill=group,color=group))+geom_line() +
+  geom_ribbon( aes(ymin = conf.low, ymax = conf.high,color=NULL),alpha=0.2)+
+  geom_point(data=D.a,aes(x=x,y=predicted,color=group,shape=gut_section),alpha=0.3)
+GG
+
+
+GG.s<-small_fig(GG+theme_bw())
+GG.s<-GG.s+labs(shape=NULL, colour=NULL,fill=NULL)+xlab("Age (days)")+
+  ylab("Mother-offsping similarity\n(Bray-Curtis, logit transformed)")+
+  theme(legend.position = "bottom", legend.box="vertical", legend.margin=margin())
+ggsave(GG.s,filename = "~/data/Areny_social/RESULTS_23/Similarity_species.pdf",
+       width = 10,height = 10, units = "cm")
+GG.s
+GG.s.JA.sex<-GG.s
+
+
+################
+
+GRID<-
+ggarrange(GG.s.BC.species+ggtitle("A) subspecies x age (Bray-Curits)"),
+          GG.s.JA.species+ggtitle("B) subspecies x age (Jaccard)"),
+          GG.s.BC.sex+ggtitle("C) sex x age (Bray-Curits)"),
+          GG.s.JA.sex+ggtitle("D) sex x age (Jaccard)"),
+          ncol = 2, nrow = 2)
+
+ggsave(GRID,filename = "~/data/Areny_social/RESULTS_revision/Mother_subspecies_sex_int.pdf",
+       width = 16, height = 16, units = "cm")
+
+
+```
+
+
+
+# Extracting microbiota similarities between siblings
+
+This chunk calculates (with the dist_to_sibl function) the Jaccard and Bray Curtis similarity indices between all individuals. In the next step, similarities between siblings are identified and extracted. This was done separately for all gut sections and for both beta diversity indices. 
+
+```{r, warning=F,message=F}
+dist_to_sibl<-function(PHYLO,DIST){
+  #####################
+  # Microbiota dissim##
+  #####################
+  PHYLO.rare<-rarefy_even_depth(PHYLO)
+  if(DIST=="BC"){DISSIM=as.matrix(1-vegdist(otu_table(PHYLO.rare)^0.5))}
+  if(DIST=="JA"){DISSIM=as.matrix(1-vegdist(data.frame(otu_table(PHYLO.rare)),method = "jaccard", binary=T))}
+  # DISSIM[upper.tri(DISSIM,diag = T)]<-NA
+  
+  SD<-data.frame(sample_data(PHYLO.rare))
+  
+  #similarities between mother and theri offspring
+  UN_vrh<-unique(SD$vrh)
+  UN_vrh<-UN_vrh[!is.na(UN_vrh)]
+
+  POC=1
+  DF.list<-list()
+  for(i in 1:length(UN_vrh)){
+    # TEST<-UN_mothers[i]%in%rownames(SD)
+       SD.sub<-SD[SD$vrh==UN_vrh[i]&!is.na(SD$vrh),]
+       if(dim(SD.sub)[1]>1){
+         DISSIM.sub<-DISSIM[rownames(SD.sub),rownames(SD.sub)]
+         DISSIM.sub[upper.tri(DISSIM.sub,diag = T)]<-NA
+         DISSIM.subl.l<-melt(DISSIM.sub)
+         SD.sub.A<-SD.sub.B<-SD.sub
+         names(SD.sub.A)<-paste0(names(SD.sub),"_A")
+         names(SD.sub.B)<-paste0(names(SD.sub),"_B")         
+         SD.sub.A$Var1<-rownames(SD.sub)
+         SD.sub.B$Var2<-rownames(SD.sub)
+         DISSIM.subl.l<-join(DISSIM.subl.l,SD.sub.A)
+         DISSIM.subl.l<-join(DISSIM.subl.l,SD.sub.B)
+         DISSIM.subl.l<-DISSIM.subl.l[!is.na(DISSIM.subl.l$value),]
+         DF.list[[POC]]<-DISSIM.subl.l
+         POC=POC+1
+       }
+  }
+  
+  DF.ALL<-do.call("rbind", DF.list)
+  DF.ALL
+}
+ 
+
+Sibl.CO_M_BC<-dist_to_sibl(PHYLO = ARENY1618_CO_M, DIST = "BC") 
+Sibl.CA_M_BC<-dist_to_sibl(PHYLO = ARENY1618_CA_M, DIST = "BC") 
+Sibl.IL_M_BC<-dist_to_sibl(PHYLO = ARENY1618_IL_M, DIST = "BC") 
+
+Sibl.CO_D_BC<-dist_to_sibl(PHYLO = ARENY1618_CO_D, DIST = "BC") 
+Sibl.CA_D_BC<-dist_to_sibl(PHYLO = ARENY1618_CA_D, DIST = "BC") 
+Sibl.IL_D_BC<-dist_to_sibl(PHYLO = ARENY1618_IL_D, DIST = "BC") 
+  
+Sibl.CO_M_JA<-dist_to_sibl(PHYLO = ARENY1618_CO_M, DIST = "JA") 
+Sibl.CA_M_JA<-dist_to_sibl(PHYLO = ARENY1618_CA_M, DIST = "JA") 
+Sibl.IL_M_JA<-dist_to_sibl(PHYLO = ARENY1618_IL_M, DIST = "JA") 
+
+Sibl.CO_D_JA<-dist_to_sibl(PHYLO = ARENY1618_CO_D, DIST = "JA") 
+Sibl.CA_D_JA<-dist_to_sibl(PHYLO = ARENY1618_CA_D, DIST = "JA") 
+Sibl.IL_D_JA<-dist_to_sibl(PHYLO = ARENY1618_IL_D, DIST = "JA") 
+  
+Sibl.BC<-rbind(Sibl.CO_M_BC,
+                  Sibl.CA_M_BC,
+                  Sibl.IL_M_BC,
+                  Sibl.CO_D_BC,
+                  Sibl.CA_D_BC,
+                  Sibl.IL_D_BC)
+
+Sibl.JA<-rbind(Sibl.CO_M_JA,
+                  Sibl.CA_M_JA,
+                  Sibl.IL_M_JA,
+                  Sibl.CO_D_JA,
+                  Sibl.CA_D_JA,
+                  Sibl.IL_D_JA)
+
+
+# ggplot(Sibl.JA,aes(x=age_estimate_A,y=value,color=gut_section_A))+geom_point()+geom_smooth(method="lm")
+# ggplot(Sibl.BC,aes(x=age_estimate_A,y=value,color=gut_section_A))+geom_point()+geom_smooth(method="lm")
+
+```
+
+# Sibling - sibling similarity (models)
+
+The main aim of these analyses is to test whether the similarity between siblings depends on their age and whether the age-dependent trajectory differs between the gut sections. Therefore, the data for all gut sections are used in a single model that accounts for interactions between sibling age and intestinal segment. The variation of similarity with offspring age is modelled with a nonlinear bs() function. The complexity of the fit is tested in a first step. In the next step, the significance of the individual predictors is tested using the lmerTest::step() function.
+
+
+```{r}
+
+##############
+#BC MODELS####
+##############
+DATA<-Sibl.BC
+DATA$value.logit<-car::logit(DATA$value)
+VECT<-paste(DATA$Var1,DATA$Var2,sep=",")
+MAT<-lmerMultiMember::weights_from_vector(VECT)
+
+
+m.lin<-lmer(value.logit ~ age_estimate_A+gut_section_A+subspecies_zkr_A+
+              age_estimate_A:gut_section_A+age_estimate_A:subspecies_zkr_A+
+               (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+m.pol2<-lmer(value.logit ~ ns(age_estimate_A,df=2)+gut_section_A+subspecies_zkr_A+
+              ns(age_estimate_A,df=2):gut_section_A+ ns(age_estimate_A,df=2):subspecies_zkr_A+
+               (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+m.pol3<-lmer(value.logit ~ ns(age_estimate_A,df=3)+gut_section_A+subspecies_zkr_A+
+              ns(age_estimate_A,df=3):gut_section_A+ ns(age_estimate_A,df=3):subspecies_zkr_A+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+m.pol4<-lmer(value.logit ~ ns(age_estimate_A,df=4)+gut_section_A+subspecies_zkr_A+
+              ns(age_estimate_A,df=4):gut_section_A+ ns(age_estimate_A,df=4):subspecies_zkr_A+
+               (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+m.pol5<-lmer(value.logit ~ ns(age_estimate_A,df=5)+gut_section_A+subspecies_zkr_A+
+              ns(age_estimate_A,df=5):gut_section_A+ ns(age_estimate_A,df=5):subspecies_zkr_A+
+               (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+AIC.tab<-AIC(m.lin,m.pol2,m.pol3,m.pol4,m.pol5)
+AIC.tab<-data.frame(Model=c("linear","splines, df=2","splines, df=3","splines, df=4","splines, df=5"),
+                   AIC.tab)
+
+#LR tests
+
+#FULL M
+m.pol4<-lmer(value.logit ~ ns(age_estimate_A,df=3)+gut_section_A+subspecies_zkr_A+
+              ns(age_estimate_A,df=3):gut_section_A+ns(age_estimate_A,df=3):subspecies_zkr_A+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+STEP<-step(m.pol4,reduce.random=F)
+FINAL<-get_model(STEP)
+
+m.pol4c_sibl.BC<-FINAL
+ANOVA.tab_sibl.BC<-STEP
+AIC.tab_sibl.BC<-AIC.tab
+
+
+
+##############
+#JA MODELS####
+##############
+DATA<-Sibl.JA
+DATA$value.logit<-car::logit(DATA$value)
+VECT<-paste(DATA$Var1,DATA$Var2,sep=",")
+MAT<-lmerMultiMember::weights_from_vector(VECT)
+
+
+m.lin<-lmer(value.logit ~ age_estimate_A+gut_section_A+subspecies_zkr_A+
+              age_estimate_A:gut_section_A+age_estimate_A:subspecies_zkr_A+
+               (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+m.pol2<-lmer(value.logit ~ ns(age_estimate_A,df=2)+gut_section_A+subspecies_zkr_A+
+              ns(age_estimate_A,df=2):gut_section_A+ns(age_estimate_A,df=2):subspecies_zkr_A+
+               (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+m.pol3<-lmer(value.logit ~ ns(age_estimate_A,df=3)+gut_section_A+subspecies_zkr_A+
+              ns(age_estimate_A,df=3):gut_section_A+ns(age_estimate_A,df=3):subspecies_zkr_A+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+m.pol4<-lmer(value.logit ~ ns(age_estimate_A,df=4)+gut_section_A+subspecies_zkr_A+
+              ns(age_estimate_A,df=4):gut_section_A+ns(age_estimate_A,df=4):subspecies_zkr_A+
+               (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+m.pol5<-lmer(value.logit ~ ns(age_estimate_A,df=5)+gut_section_A+subspecies_zkr_A+
+              ns(age_estimate_A,df=5):gut_section_A+ns(age_estimate_A,df=5):subspecies_zkr_A+
+               (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+AIC.tab<-AIC(m.lin,m.pol2,m.pol3,m.pol4,m.pol5)
+AIC.tab<-data.frame(Model=c("linear","splines, df=2","splines, df=3","splines, df=4","splines, df=5"),
+                   AIC.tab)
+
+#LR tests
+
+#FULL M
+m.pol4<-lmer(value.logit ~ ns(age_estimate_A,df=3)+gut_section_A+subspecies_zkr_A+
+              ns(age_estimate_A,df=3):gut_section_A+ns(age_estimate_A,df=3):subspecies_zkr_A+
+              (1 | Var1), memberships = list(Var1 = MAT),
+             data = DATA)
+
+STEP<-step(m.pol4,reduce.random=F)
+FINAL<-get_model(STEP)
+
+m.pol4c_sibl.JA<-FINAL
+ANOVA.tab_sibl.JA<-STEP
+AIC.tab_sibl.JA<-AIC.tab
+
+```
+
+
+# Sibling sibling similarity (results, tables)
+
+In this part, tables are created with the results of the above analyses
+
+```{r fig.height=20,fig.width=12}
+AIC.tab.all<-rbind(AIC.tab_sibl.BC,AIC.tab_sibl.JA)
+Comparission<-rep(c("Offspring-offspring"),each=dim(AIC.tab_sibl.BC)[1]*2)
+Disimilarity<-rep(c("Bray-Curtis", "Jaccard"),each=dim(AIC.tab_sibl.BC)[1])
+AIC.tab.all<-data.frame(Comparission,Disimilarity,AIC.tab.all)
+AIC.tab.all.off<-AIC.tab.all
+write.table(AIC.tab.all.off,file = "~/data/Areny_social/RESULTS_revision/AIC_offspring.txt",sep="\t",row.names = F,quote = F)
+
+AIC.tab.all_parent_off<-rbind(AIC.tab.parents,AIC.tab.all.off)
+write.table(AIC.tab.all_parent_off,file = "~/data/Areny_social/RESULTS_revision/AIC_parent_offspring.txt",sep="\t",row.names = F,quote = F)
+
+write.table(AIC.tab.parents,file = "~/data/Areny_social/RESULTS_revision/AIC.tab.all_SEX.txt",sep="\t",row.names = F,quote = F)
+
+ANOVA.tab_sibl.BCx<-ANOVA.tab_sibl.BC$fixed
+ANOVA.tab_sibl.JAx<-ANOVA.tab_sibl.JA$fixed
+
+Predictor<-c(rownames(ANOVA.tab_sibl.BC$fixed),
+             rownames(ANOVA.tab_sibl.JA$fixed))
+
+ANOVA.tab_sibl.BCx<-data.frame(Disimilarity="Bray-Curtis",Comparission="Mother-offspring",ANOVA.tab_sibl.BCx)
+ANOVA.tab_sibl.JAx<-data.frame(Disimilarity="Jaccard",Comparission="Mother-offspring",ANOVA.tab_sibl.JAx)
+
+ANOVA.tab.all<-rbind(ANOVA.tab_sibl.BCx,
+                     ANOVA.tab_sibl.JAx)
+ANOVA.tab.all<-data.frame(ANOVA.tab.all,Predictor)
+
+ANOVA.tab.all<-ANOVA.tab.all[,c(1,2,10,6:9)]
+
+ANOVA.tab.off<-ANOVA.tab.all
+write.table(ANOVA.tab.off,file = "~/data/Areny_social/RESULTS_revision/ANOVA_offspring_SEX.txt",sep="\t",row.names = F,quote = F)
+
+ANOVA.tab.all_parent_off<-rbind(ANOVA.tab.parents,ANOVA.tab.off)
+write.table(ANOVA.tab.all_parent_off,file = "~/data/Areny_social/RESULTS_revision/ANOVA.tab.all_parent_off_SEX.txt",sep="\t",row.names = F,quote = F)
+
+
+```
+
+# Sibling sibling similarity (predictions)
+
+We used the PLOT_PRED.fnc_off function to generate predictions for a mixed model that estimates the dependence of sibling microbiota similarity on age. Separate predictions were generated for each gut section and for the Bray-Curtis and Jaccard dissimilarities. 
+
+```{r fig.height=20,fig.width=12}
+
+
+PLOT_PRED.fnc_off<-function(MODEL,DATA,BASELINE,COLOR){
+
+  pred<-ggpredict(MODEL,terms = c("age_estimate_A"),ci.lvl = 0.95,interval = "confidence")
+  GG<-ggplot(pred, aes(x = x, y = predicted))+geom_line(color=COLOR) + geom_ribbon( aes(ymin = conf.low, ymax = conf.high),fill=COLOR,alpha=0.2)
+  GG<-GG+geom_point(data=DATA,aes(x=age_estimate_A,y=Microb.logit),color=COLOR,alpha=0.5,size=1)
+
+  SSS<-summary(BASELINE)
+  MEAN<-SSS$coefficients[,1]
+  LCI<-MEAN-1.98*SSS$coefficients[,2]
+  HCI<-MEAN+1.98*SSS$coefficients[,2]
+
+  
+  GG<-append_layers(GG,geom_segment(aes(x=min(as.numeric(DATA$age_estimate)),xend=max(as.numeric(DATA$age_estimate)),
+                                      y=MEAN,yend=MEAN),color="gray50",linetype = "dashed"), position = "bottom")
+  GG<-append_layers(GG,geom_ribbon(aes(ymin = LCI, ymax = HCI), fill = "grey90",colour=NA), position = "bottom")
+  GG
+}
+
+######################
+#BC MODELS ###########
+######################
+
+DATA<-Sibl.BC
+DATA<-DATA[!is.na(DATA$age_estimate_A),]
+DATA$Microb.logit<-car::logit(DATA$value)
+
+DATA.CA<-DATA[DATA$gut_section_A=="Caecum",]
+DATA.CO<-DATA[DATA$gut_section_A=="Colon",]
+DATA.IL<-DATA[DATA$gut_section_A=="Ileum",]
+
+VECT<-paste(DATA.CA$Var1,DATA.CA$Var2,sep=",")
+MAT.CA<-lmerMultiMember::weights_from_vector(VECT)
+
+VECT<-paste(DATA.CO$Var1,DATA.CO$Var2,sep=",")
+MAT.CO<-lmerMultiMember::weights_from_vector(VECT)
+
+VECT<-paste(DATA.IL$Var1,DATA.IL$Var2,sep=",")
+MAT.IL<-lmerMultiMember::weights_from_vector(VECT)
+
+#caecum
+m.2<-lmer(Microb.logit ~ ns(age_estimate_A,df=2)+(1|Var1), memberships = list(Var1 = MAT.CA),data = DATA.CA)
+m.3<-lmer(Microb.logit ~ ns(age_estimate_A,df=3)+(1|Var1), memberships = list(Var1 = MAT.CA),data = DATA.CA)
+m.4<-lmer(Microb.logit ~ ns(age_estimate_A,df=4)+(1|Var1), memberships = list(Var1 = MAT.CA),data = DATA.CA)
+AIC(m.2,m.3,m.4)
+m.CA<-m.3
+
+m.2<-lmer(Microb.logit ~ ns(age_estimate_A,df=2)+(1|Var1), memberships = list(Var1 = MAT.CO),data = DATA.CO)
+m.3<-lmer(Microb.logit ~ ns(age_estimate_A,df=3)+(1|Var1), memberships = list(Var1 = MAT.CO),data = DATA.CO)
+m.4<-lmer(Microb.logit ~ ns(age_estimate_A,df=4)+(1|Var1), memberships = list(Var1 = MAT.CO),data = DATA.CO)
+AIC(m.2,m.3,m.4)
+m.CO<-m.3
+
+m.2<-lmer(Microb.logit ~ ns(age_estimate_A,df=2)+(1|Var1), memberships = list(Var1 = MAT.IL),data = DATA.IL)
+m.3<-lmer(Microb.logit ~ ns(age_estimate_A,df=3)+(1|Var1), memberships = list(Var1 = MAT.IL),data = DATA.IL)
+m.4<-lmer(Microb.logit ~ ns(age_estimate_A,df=4)+(1|Var1), memberships = list(Var1 = MAT.IL),data = DATA.IL)
+AIC(m.2,m.3,m.4)
+m.IL<-m.2
+
+
+pred_GM_CO_MD_BC<-PLOT_PRED.fnc_off(MODEL=m.CO,DATA=DATA.CO,BASELINE=mod_GM_CO_MD_BC,COLOR="blue")+theme_bw()
+pred_GM_CA_MD_BC<-PLOT_PRED.fnc_off(MODEL=m.CA,DATA=DATA.CA,BASELINE=mod_GM_CA_MD_BC,COLOR="red")+theme_bw()
+pred_GM_IL_MD_BC<-PLOT_PRED.fnc_off(MODEL=m.IL,DATA=DATA.IL,BASELINE=mod_GM_IL_MD_BC,COLOR="green")+theme_bw()
+
+
+######################
+#JA MODELS############
+######################
+
+DATA<-Sibl.JA
+DATA<-DATA[!is.na(DATA$age_estimate_A),]
+DATA$Microb.logit<-car::logit(DATA$value)
+
+DATA.CA<-DATA[DATA$gut_section_A=="Caecum",]
+DATA.CO<-DATA[DATA$gut_section_A=="Colon",]
+DATA.IL<-DATA[DATA$gut_section_A=="Ileum",]
+
+VECT<-paste(DATA.CA$Var1,DATA.CA$Var2,sep=",")
+MAT.CA<-lmerMultiMember::weights_from_vector(VECT)
+
+VECT<-paste(DATA.CO$Var1,DATA.CO$Var2,sep=",")
+MAT.CO<-lmerMultiMember::weights_from_vector(VECT)
+
+VECT<-paste(DATA.IL$Var1,DATA.IL$Var2,sep=",")
+MAT.IL<-lmerMultiMember::weights_from_vector(VECT)
+
+#caecum
+m.2<-lmer(Microb.logit ~ ns(age_estimate_A,df=2)+(1|Var1), memberships = list(Var1 = MAT.CA),data = DATA.CA)
+m.3<-lmer(Microb.logit ~ ns(age_estimate_A,df=3)+(1|Var1), memberships = list(Var1 = MAT.CA),data = DATA.CA)
+m.4<-lmer(Microb.logit ~ ns(age_estimate_A,df=4)+(1|Var1), memberships = list(Var1 = MAT.CA),data = DATA.CA)
+AIC(m.2,m.3,m.4)
+m.CA<-m.3
+
+m.2<-lmer(Microb.logit ~ ns(age_estimate_A,df=2)+(1|Var1), memberships = list(Var1 = MAT.CO),data = DATA.CO)
+m.3<-lmer(Microb.logit ~ ns(age_estimate_A,df=3)+(1|Var1), memberships = list(Var1 = MAT.CO),data = DATA.CO)
+m.4<-lmer(Microb.logit ~ ns(age_estimate_A,df=4)+(1|Var1), memberships = list(Var1 = MAT.CO),data = DATA.CO)
+AIC(m.2,m.3,m.4)
+m.CO<-m.3
+
+m.2<-lmer(Microb.logit ~ ns(age_estimate_A,df=2)+(1|Var1), memberships = list(Var1 = MAT.IL),data = DATA.IL)
+m.3<-lmer(Microb.logit ~ ns(age_estimate_A,df=3)+(1|Var1), memberships = list(Var1 = MAT.IL),data = DATA.IL)
+m.4<-lmer(Microb.logit ~ ns(age_estimate_A,df=4)+(1|Var1), memberships = list(Var1 = MAT.IL),data = DATA.IL)
+AIC(m.2,m.3,m.4)
+m.IL<-m.2
+
+
+pred_GM_CO_MD_JA<-PLOT_PRED.fnc_off(MODEL=m.CO,DATA=DATA.CO,BASELINE=mod_GM_CO_MD_JA,COLOR="blue")+theme_bw()
+pred_GM_CA_MD_JA<-PLOT_PRED.fnc_off(MODEL=m.CA,DATA=DATA.CA,BASELINE=mod_GM_CA_MD_JA,COLOR="red")+theme_bw()
+pred_GM_IL_MD_JA<-PLOT_PRED.fnc_off(MODEL=m.IL,DATA=DATA.IL,BASELINE=mod_GM_IL_MD_JA,COLOR="green")+theme_bw()
+
+
+################
+# plots#########
+################
+
+pred_GM_CO_MD_BC.s<-small_fig(pred_GM_CO_MD_BC)+xlab("Age (days)")+ylab("Sibling-sibling similarity\n(logit transformed)")
+pred_GM_CA_MD_BC.s<-small_fig(pred_GM_CA_MD_BC)+xlab("Age (days)")+ylab("Sibling-sibling similarity\n(logit transformed)")
+pred_GM_IL_MD_BC.s<-small_fig(pred_GM_IL_MD_BC)+xlab("Age (days)")+ylab("Sibling-sibling similarity\n(logit transformed)")
+
+pred_GM_CO_MD_JA.s<-small_fig(pred_GM_CO_MD_JA)+xlab("Age (days)")+ylab("Sibling-sibling similarity\n(logit transformed)")
+pred_GM_CA_MD_JA.s<-small_fig(pred_GM_CA_MD_JA)+xlab("Age (days)")+ylab("Sibling-sibling similarity\n(logit transformed)")
+pred_GM_IL_MD_JA.s<-small_fig(pred_GM_IL_MD_JA)+xlab("Age (days)")+ylab("Sibling-sibling similarity\n(logit transformed)")
+
+
+GRID.BC<-ggarrange(pred_GM_IL_MD_BC.s+ggtitle("A) Ileum"),
+                   pred_GM_CA_MD_BC.s+ggtitle("B) Caecum"),
+                    pred_GM_CO_MD_BC.s+ggtitle("C) Colon"),
+                ncol = 3)
+
+GRID.JA<-ggarrange(pred_GM_IL_MD_JA.s+ggtitle("A) Ileum"),
+                   pred_GM_CA_MD_JA.s+ggtitle("B) Caecum"),
+                   pred_GM_CO_MD_JA.s+ggtitle("C) Colon"),
+                   ncol = 3)
+
+GRID.BC2<-ggarrange(pred_GM_IL_MD_BC.s+ggtitle("A) Ileum"),
+                    pred_GM_CA_MD_BC.s+ggtitle("B) Caecum"),
+          pred_GM_CO_MD_BC.s+ggtitle("C) Colon"),
+          
+          nrow = 3)
+
+GRID.JA2<-ggarrange(pred_GM_IL_MD_JA.s+ggtitle("A) Ileum"),
+                    pred_GM_CA_MD_JA.s+ggtitle("B) Caecum"),
+        pred_GM_CO_MD_JA.s+ggtitle("B) Colon"),
+          
+          nrow = 3)
+
+ggsave(GRID.BC,filename = "~/data/Areny_social/RESULTS_revision/Offspring_offspring_disimilarity.BC_v2.pdf",width = 18, height = 8, units="cm")
+ggsave(GRID.JA,filename = "~/data/Areny_social/RESULTS_revision/Offspring_offspring_disimilarity.JA_v2.pdf",width = 18, height = 8, units="cm")
+
+ggsave(GRID.BC2,filename = "~/data/Areny_social/RESULTS_revision/Offspring_offspring_disimilarity.BC_v2b.pdf",width = 8, height = 18, units="cm")
+ggsave(GRID.JA2,filename = "~/data/Areny_social/RESULTS_revision/Offspring_offspring_disimilarity.JA_v2b.pdf",width = 8, height = 18, units="cm")
+
+GRID.JA
+GRID.BC
+
+```
+
+
+#ASVS correlations with genetic relatedness and social interactions
+
+Prevalent ASVs (detected in at least 30 individuals) were selected for analyses testing the correlation between ASV abundance variation and genetic relatedness or intensity of social interactions. CLR_diff transforms the ASV abundances using the clr transformation and then creates a matrix for each ASV with the absolute differences of the clr-transformed values between each pair of samples. clr_corr is a function that correlates these matrices with matrices containing data on genetic relatedness or social interactions using Procrustes analysis. All these analyses were performed separately for each gut section and subspecies.
+
+```{r}
+
+# #
+library(compositions)
+PH01<-ARENY1618
+PH01<-transform_sample_counts(PH01, function(x) ifelse(x>0,1,0))
+PREV<-taxa_sums(PH01)
+
+GUT_SECTION<-sample_data(PH01)$gut_section
+GUT_SECTION.prev<-data.frame(t(apply(otu_table(PH01),2,function(x) tapply(x,GUT_SECTION,sum))))
+
+TRESH<-29
+il.prev<-rownames(GUT_SECTION.prev)[GUT_SECTION.prev$Ileum>TRESH]
+cae.prev<-rownames(GUT_SECTION.prev)[GUT_SECTION.prev$Caecum>TRESH]
+co.prev<-rownames(GUT_SECTION.prev)[GUT_SECTION.prev$Colon>TRESH]
+length(il.prev)
+length(cae.prev)
+length(co.prev)
+
+
+#TAHLE FUNKCE:
+#1 udela CLR na phylosequ
+#odstrani malo abundantni otu
+#prevede do tabulky kde jsou pro jednotlive OTU rozdily mezi jednotlivymi vzorky
+CLR_diff<-function(PHYLO,KEEP){
+  PHYLO.trans<-transform_sample_counts(PHYLO,function(x) x/sum(x))
+  OTU_T<-otu_table(PHYLO)
+  OTU_T.trans<-otu_table(PHYLO.trans)
+  class(OTU_T)<-"matrix"
+  class(OTU_T.trans)<-"matrix"
+  OTU_T.clr<-clr(OTU_T+1)
+
+  OTU_T.clr<-OTU_T.clr[,colnames(OTU_T.clr)%in%KEEP]
+  OTU_T.trans<-OTU_T.trans[,colnames(OTU_T.trans)%in%KEEP]
+
+  # i<-1
+  # j<-1000
+
+  # ACT_OTU<-OTU_T.clr[,i]
+  # ACT_trans<-OTU_T.trans[,i]
+  CLR_dis<-as.numeric()
+  REL_dis<-as.numeric()
+
+  DIFF.clr<-list()
+  DIFF.clr.rank<-list()
+  DIFF.relat<-list()
+  DIFF.relat.rank<-list()
+  DIFF.01L<-list()
+
+  for(j in 1:dim(OTU_T.clr)[2]){
+    #print(j)
+    ACT_OTU<-OTU_T.clr[,j]
+    ACT_trans<-OTU_T.trans[,j]
+
+    ####rozdily v relativnich abundancich###########
+    DIFF.rel<-abs(outer(ACT_trans,ACT_trans, '-')) #relativni rozdily v proporcich
+    #DIFF.rel[upper.tri(DIFF.rel,diag = T)]<-NA
+    DIFF.rel.l<-melt(DIFF.rel)
+    #DIFF.rel.l<-na.omit(DIFF.rel.l)
+    DIFF.relat[[j]]<-DIFF.rel.l$value
+
+    DIFF.relat.rank[[j]]<-rank(DIFF.rel.l$value)
+
+    #rozdily po clr trasformaci
+    DIFF<-abs(outer(ACT_OTU,ACT_OTU, '-')) #absolutni rozdily po clr
+    #DIFF[upper.tri(DIFF,diag = T)]<-NA
+    DIFF.l<-melt(DIFF)
+    DIFF.l<-na.omit(DIFF.l)
+    DIFF.clr[[j]]<-DIFF.l$value
+    DIFF.clr.rank[[j]]<-rank(DIFF.l$value)
+
+    #rozdily v pritommnosti nepritomnosti
+    #0 ~ u zadneho, 1 u jednoho, 2 ~ u obou
+    ACT_01<-ACT_trans>0
+    DIFF.01<-abs(outer(ACT_01,ACT_01, '+')) #relativni rozdily v proporcich
+    #DIFF.rel[upper.tri(DIFF.rel,diag = T)]<-NA
+    DIFF.01.l<-melt(DIFF.01)
+    #DIFF.rel.l<-na.omit(DIFF.rel.l)
+    DIFF.01L[[j]]<-DIFF.01.l$value
+  }
+
+  DIFF.samples<-DIFF.l[,1:2] #seznam vzorku, ktere se porovnavali
+  DIFF.samples$JN<-paste(DIFF.samples$Var1,DIFF.samples$Var2,sep="_")
+
+  DIFF.clr.matrix<-do.call("cbind",DIFF.clr)
+  DIFF.clr.rank.matrix<-do.call("cbind",DIFF.clr.rank)
+  DIFF.relat.matrix<-do.call("cbind",DIFF.relat)
+  DIFF.relat.rank.matrix<-do.call("cbind",DIFF.relat.rank)
+  DIFF.01L.matrix<-do.call("cbind",DIFF.01L)
+
+  colnames(DIFF.clr.matrix)<-colnames(OTU_T.clr)
+  colnames(DIFF.clr.rank.matrix)<-colnames(OTU_T.clr)
+  colnames(DIFF.relat.matrix)<-colnames(OTU_T.clr)
+  colnames(DIFF.relat.rank.matrix)<-colnames(OTU_T.clr)
+  colnames(DIFF.01L.matrix)<-colnames(OTU_T.clr)
+
+  DIFF.clr.df<-data.frame(DIFF.samples,DIFF.clr.matrix)
+  DIFF.clr.rank.df<-data.frame(DIFF.samples,DIFF.clr.rank.matrix)
+  DIFF.relat.matrix.df<-data.frame(DIFF.samples,DIFF.relat.matrix)
+  DIFF.relat.rank.matrix.df<-data.frame(DIFF.samples,DIFF.relat.rank.matrix)
+  DIFF.01L.matrix.df<-data.frame(DIFF.samples,DIFF.01L.matrix)
+
+  RESULTS<-list(DIFF.clr.df,DIFF.clr.rank.df,DIFF.relat.matrix.df,DIFF.relat.rank.matrix.df,DIFF.01L.matrix.df)
+  names(RESULTS)<-c("CLR","Ranks","REL","REL.ranks","PresAbs")
+  RESULTS
+}
+
+
+#####CLR Values to matrix##########
+# CLR.tab<-ARENY1618_CO.clr$CLR
+
+clr_corr<-function(CLR.tab,GENET,SOC){
+
+  Mantel_soc.df.list<-list()
+  Mantel_gen.df.list<-list()
+
+  Protest.soc.df.list<-list()
+  Protest.gen.df.list<-list()
+
+  Protest.soc.obj.list<-list()
+  Protest.gen.obj.list<-list()
+
+  OTUS<-grep("OTU",names(CLR.tab))
+  OTUS_names<-names(CLR.tab)[OTUS]
+  for(i in 1:length(OTUS)){
+    # print(names(CLR.tab)[OTUS[i]])
+    ########################
+    #convert to wide format#
+    ########################
+
+    CLR.tab.ACT<-CLR.tab[,c(1,2,OTUS[i])]
+    CLR.tab.ACT.w<-reshape(CLR.tab.ACT, idvar = "Var1", timevar = "Var2", direction = "wide")
+    colnames(CLR.tab.ACT.w)<-gsub("OTU_[0-9]*[.]","",colnames(CLR.tab.ACT.w))
+    rownames(CLR.tab.ACT.w)<-CLR.tab.ACT.w[,1]
+    CLR.tab.ACT.w<-as.matrix(CLR.tab.ACT.w[,2:dim(CLR.tab.ACT.w)[2]])
+
+    CLR.tab.ACT.w<-CLR.tab.ACT.w/max(CLR.tab.ACT.w) #tohle eventualne vypnout
+    ##########################
+    ##Correlation with social#
+    ##########################
+    COMMON<-intersect(rownames(CLR.tab.ACT.w),rownames(SOC))
+    SOC.sub<-SOC[COMMON,COMMON]
+    CLR.tab.ACT.w.sub<-CLR.tab.ACT.w[COMMON,COMMON]
+    Mantel_soc<-mantel(as.dist(CLR.tab.ACT.w.sub),as.dist(1-SOC.sub),method = "spearman",permutations = 9999)
+
+    SOC.sub.pc<-pcoa_my(as.dist(1-SOC.sub),correction = "cailliez")$vectors
+    CLR.tab.ACT.w.sub.pc<-pcoa_my(as.dist(CLR.tab.ACT.w.sub)^0.5)$vectors
+    Protest_soc<-protest(SOC.sub.pc,CLR.tab.ACT.w.sub.pc,permutations = 9999)
+
+    ###########################
+    ##Correlation with genetic#
+    ###########################
+    COMMON<-intersect(rownames(CLR.tab.ACT.w),rownames(GENET))
+    GENET.sub<-GENET[COMMON,COMMON]
+    CLR.tab.ACT.w.sub<-CLR.tab.ACT.w[COMMON,COMMON]
+    Mantel_gen<-mantel(as.dist(CLR.tab.ACT.w.sub),as.dist(1-GENET.sub),method = "spearman",permutations = 9999)
+
+    GENET.sub.pc<-pcoa_my(as.dist(1-GENET.sub),correction = "cailliez")$vectors
+    CLR.tab.ACT.w.sub.pc<-pcoa_my(as.dist(CLR.tab.ACT.w.sub),correction = "cailliez")$vectors
+    Protest_gen<-protest(GENET.sub.pc,CLR.tab.ACT.w.sub.pc,permutations = 9999)
+
+    ###########################
+    #COllect results###########
+    ###########################
+
+    Mantel_soc.df<-as.numeric(c(Mantel_soc$statistic,Mantel_soc$signif))
+    Mantel_gen.df<-as.numeric(c(Mantel_gen$statistic,Mantel_gen$signif))
+
+    Protest.soc.df<-as.numeric(c(Protest_soc$t0,Protest_soc$ss,Protest_soc$signif))
+    Protest.gen.df<-as.numeric(c(Protest_gen$t0,Protest_gen$ss,Protest_gen$signif))
+
+    Mantel_soc.df.list[[i]]<-Mantel_soc.df
+    Mantel_gen.df.list[[i]]<-Mantel_gen.df
+
+    Protest.soc.df.list[[i]]<-Protest.soc.df
+    Protest.gen.df.list[[i]]<-Protest.gen.df
+
+    Protest.soc.obj.list[[i]]<-Protest_soc
+    Protest.gen.obj.list[[i]]<-Protest_gen
+
+  }
+
+  Mantel_soc.df.all<-data.frame(OTUS_names,do_call("rbind",Mantel_soc.df.list))
+  Mantel_gen.df.all<-data.frame(OTUS_names,do_call("rbind",Mantel_gen.df.list))
+  Protest.soc.df.all<-data.frame(OTUS_names,do_call("rbind",Protest.soc.df.list))
+  Protest.gen.df.all<-data.frame(OTUS_names,do_call("rbind",Protest.gen.df.list))
+
+  names(Mantel_soc.df.all)<-names(Mantel_gen.df.all)<-c("OTU","r","p")
+  names(Protest.soc.df.all)<-names(Protest.gen.df.all)<-c("OTU","ss","r","p")
+
+  Mantel_soc.df.all$fdr<-p.adjust(Mantel_soc.df.all$p, method="fdr")
+  Mantel_gen.df.all$fdr<-p.adjust(Mantel_gen.df.all$p, method="fdr")
+  Protest.soc.df.all$fdr<-p.adjust(Protest.soc.df.all$p, method="fdr")
+  Protest.gen.df.all$fdr<-p.adjust(Protest.gen.df.all$p, method="fdr")
+
+  list(Mantel_soc=Mantel_soc.df.all,
+       Mantel_gen=Mantel_gen.df.all,
+       Protest.soc=Protest.soc.df.all,
+       Protest.gen=Protest.gen.df.all,
+       Protest.soc.obj=Protest.soc.obj.list,
+       Protest.gen.obj=Protest.gen.obj.list)
+
+}
+
+# CLR.tab=ARENY1618_CO.clr$CLR,
+# SOC=SOC_matrixD,
+# GENET=mmd_matrix
+
+ARENY1618_CO_D.clr<-CLR_diff(PHYLO=ARENY1618_CO_D,KEEP = co.prev)
+ARENY1618_CA_D.clr<-CLR_diff(PHYLO=ARENY1618_CA_D,KEEP = cae.prev)
+ARENY1618_IL_D.clr<-CLR_diff(PHYLO=ARENY1618_IL_D,KEEP = il.prev)
+
+ARENY1618_CO_M.clr<-CLR_diff(PHYLO=ARENY1618_CO_M,KEEP = co.prev)
+ARENY1618_CA_M.clr<-CLR_diff(PHYLO=ARENY1618_CA_M,KEEP = cae.prev)
+ARENY1618_IL_M.clr<-CLR_diff(PHYLO=ARENY1618_IL_M,KEEP = il.prev)
+
+
+
+ARENY1618_CO_D.clr.RES<-clr_corr(CLR.tab=ARENY1618_CO_D.clr$CLR,
+                   SOC=SOC_matrixD,
+                   GENET=mmd_matrix)
+
+ARENY1618_CA_D.clr.RES<-clr_corr(CLR.tab=ARENY1618_CA_D.clr$CLR,
+                   SOC=SOC_matrixD,
+                   GENET=mmd_matrix)
+
+ARENY1618_IL_D.clr.RES<-clr_corr(CLR.tab=ARENY1618_IL_D.clr$CLR,
+                   SOC=SOC_matrixD,
+                   GENET=mmd_matrix)
+
+
+ARENY1618_CO_M.clr.RES<-clr_corr(CLR.tab=ARENY1618_CO_M.clr$CLR,
+                   SOC=SOC_matrixM,
+                   GENET=mmm_matrix)
+
+ARENY1618_CA_M.clr.RES<-clr_corr(CLR.tab=ARENY1618_CA_M.clr$CLR,
+                   SOC=SOC_matrixM,
+                   GENET=mmm_matrix)
+
+ARENY1618_IL_M.clr.RES<-clr_corr(CLR.tab=ARENY1618_IL_M.clr$CLR,
+                   SOC=SOC_matrixM,
+                   GENET=mmm_matrix)
+
+# save(ARENY1618_CO_D.clr.RES,file="/home/kreising/data/Areny_social/RESULTS_revision/OTU_models/ARENY1618_CO_D.clr.RES.R")
+# save(ARENY1618_CA_D.clr.RES,file="/home/kreising/data/Areny_social/RESULTS_revision/OTU_models/ARENY1618_CA_D.clr.RES.R")
+# save(ARENY1618_IL_D.clr.RES,file="/home/kreising/data/Areny_social/RESULTS_revision/OTU_models/ARENY1618_IL_D.clr.RES.R")
+# save(ARENY1618_CO_M.clr.RES,file="/home/kreising/data/Areny_social/RESULTS_revision/OTU_models/ARENY1618_CO_M.clr.RES.R")
+# save(ARENY1618_CA_M.clr.RES,file="/home/kreising/data/Areny_social/RESULTS_revision/OTU_models/ARENY1618_CA_M.clr.RES.R")
+# save(ARENY1618_IL_M.clr.RES,file="/home/kreising/data/Areny_social/RESULTS_revision/OTU_models/ARENY1618_IL_M.clr.RES.R")
+
+
+
+```
+
+```{r}
+# load("/home/kreising/data/Areny_social/RESULTS_revision/OTU_models/ARENY1618_CO_D.clr.RES.R")
+# load("/home/kreising/data/Areny_social/RESULTS_revision/OTU_models/ARENY1618_CA_D.clr.RES.R")
+# load("/home/kreising/data/Areny_social/RESULTS_revision/OTU_models/ARENY1618_IL_D.clr.RES.R")
+# load("/home/kreising/data/Areny_social/RESULTS_revision/OTU_models/ARENY1618_CO_M.clr.RES.R")
+# load("/home/kreising/data/Areny_social/RESULTS_revision/OTU_models/ARENY1618_CA_M.clr.RES.R")
+# load("/home/kreising/data/Areny_social/RESULTS_revision/OTU_models/ARENY1618_IL_M.clr.RES.R")
+```
+
+Procrustes sums of squares (calculated for each ASV and matrix of social interactions or genetic relatedness) for MMM and MMD were compared using Spearman correlations and Wilcoxon test for pairs.
+
+```{r}
+cor.test(ARENY1618_CO_D.clr.RES$Protest.soc$ss,ARENY1618_CO_M.clr.RES$Protest.soc$ss,method = "spearman")
+cor.test(ARENY1618_CA_D.clr.RES$Protest.soc$ss,ARENY1618_CA_M.clr.RES$Protest.soc$ss,method = "spearman")
+cor.test(ARENY1618_IL_D.clr.RES$Protest.soc$ss,ARENY1618_IL_M.clr.RES$Protest.soc$ss,method = "spearman")
+
+cor.test(ARENY1618_CO_D.clr.RES$Protest.gen$ss,ARENY1618_CO_M.clr.RES$Protest.gen$ss,method = "spearman")
+cor.test(ARENY1618_CA_D.clr.RES$Protest.gen$ss,ARENY1618_CA_M.clr.RES$Protest.gen$ss,method = "spearman")
+cor.test(ARENY1618_IL_D.clr.RES$Protest.gen$ss,ARENY1618_IL_M.clr.RES$Protest.gen$ss,method = "spearman")
+
+wilcox.test(ARENY1618_CO_D.clr.RES$Protest.soc$ss,ARENY1618_CO_M.clr.RES$Protest.soc$ss,paired = T)
+summary(ARENY1618_CO_D.clr.RES$Protest.soc$ss)
+summary(ARENY1618_CO_M.clr.RES$Protest.soc$ss)
+
+wilcox.test(ARENY1618_CA_D.clr.RES$Protest.soc$ss,ARENY1618_CA_M.clr.RES$Protest.soc$ss,paired = T)
+summary(ARENY1618_CA_D.clr.RES$Protest.soc$ss)
+summary(ARENY1618_CA_M.clr.RES$Protest.soc$ss)
+
+wilcox.test(ARENY1618_IL_D.clr.RES$Protest.soc$ss,ARENY1618_IL_M.clr.RES$Protest.soc$ss,paired = T)
+summary(ARENY1618_IL_D.clr.RES$Protest.soc$ss)
+summary(ARENY1618_IL_M.clr.RES$Protest.soc$ss)
+
+
+wilcox.test(ARENY1618_CO_D.clr.RES$Protest.gen$ss,ARENY1618_CO_M.clr.RES$Protest.gen$ss,paired = T)
+wilcox.test(ARENY1618_CA_D.clr.RES$Protest.gen$ss,ARENY1618_CA_M.clr.RES$Protest.gen$ss,paired = T)
+wilcox.test(ARENY1618_IL_D.clr.RES$Protest.gen$ss,ARENY1618_IL_M.clr.RES$Protest.gen$ss,paired = T)
+
+```
+
+
+This section extracts the values of the Procrustes correlation coefficients (which quantify the strength of the dependence of each ASV on the intensity of social contact or genetic relatedness) from the analyses performed separately for each subspecies and gut section and creates a heatmat summarising the results. 
+
+```{r,fig.height=20,fig.width=15}
+DF<-ARENY1618_CO_D.clr.RES$Protest.soc[,c(1,5)]
+names(DF)[2]<-"CO_D_SOC"
+DF.j<-DF
+
+DF<-ARENY1618_CO_M.clr.RES$Protest.soc[,c(1,5)]
+names(DF)[2]<-"CO_M_SOC"
+DF.j<-join(DF.j,DF,type="full")
+
+DF<-ARENY1618_CA_D.clr.RES$Protest.soc[,c(1,5)]
+names(DF)[2]<-"CA_D_SOC"
+DF.j<-join(DF.j,DF,type="full")
+
+DF<-ARENY1618_CA_M.clr.RES$Protest.soc[,c(1,5)]
+names(DF)[2]<-"CA_M_SOC"
+DF.j<-join(DF.j,DF,type="full")
+
+DF<-ARENY1618_IL_D.clr.RES$Protest.soc[,c(1,5)]
+names(DF)[2]<-"IL_D_SOC"
+DF.j<-join(DF.j,DF,type="full")
+
+DF<-ARENY1618_IL_M.clr.RES$Protest.soc[,c(1,5)]
+names(DF)[2]<-"IL_M_SOC"
+DF.j<-join(DF.j,DF,type="full")
+
+
+##############
+
+DF<-ARENY1618_CO_D.clr.RES$Protest.gen[,c(1,5)]
+names(DF)[2]<-"CO_D_GEN"
+DF.j<-join(DF.j,DF,type="full")
+
+DF<-ARENY1618_CO_M.clr.RES$Protest.gen[,c(1,5)]
+names(DF)[2]<-"CO_M_GEN"
+DF.j<-join(DF.j,DF,type="full")
+
+DF<-ARENY1618_CA_D.clr.RES$Protest.gen[,c(1,5)]
+names(DF)[2]<-"CA_D_GEN"
+DF.j<-join(DF.j,DF,type="full")
+
+DF<-ARENY1618_CA_M.clr.RES$Protest.gen[,c(1,5)]
+names(DF)[2]<-"CA_M_GEN"
+DF.j<-join(DF.j,DF,type="full")
+
+DF<-ARENY1618_IL_D.clr.RES$Protest.gen[,c(1,5)]
+names(DF)[2]<-"IL_D_GEN"
+DF.j<-join(DF.j,DF,type="full")
+
+DF<-ARENY1618_IL_M.clr.RES$Protest.gen[,c(1,5)]
+names(DF)[2]<-"IL_M_GEN"
+DF.j<-join(DF.j,DF,type="full")
+DF.j.fdr<-DF.j
+FILTER<-apply(DF.j[2:dim(DF.j)[2]],1,function(x) min(x,na.rm = T))<0.05
+DF.j.sub<-DF.j[FILTER,]
+
+FDR<-DF.j.sub[2:dim(DF.j.sub)[2]]
+FDR[FDR<0.05&!is.na(FDR)]<-0
+FDR[FDR!=0&!is.na(FDR)]<-1
+FDR[is.na(FDR)]<-"not_tested"
+FDR[FDR=="0"]<-"significant"
+FDR[FDR=="1"]<-"nonsignificant"
+
+
+SOC_D_CO<-as.character(ARENY1618_CO_D.clr.RES$Protest.soc$OTU[ARENY1618_CO_D.clr.RES$Protest.soc$fdr<0.05])
+SOC_M_CO<-as.character(ARENY1618_CO_M.clr.RES$Protest.soc$OTU[ARENY1618_CO_M.clr.RES$Protest.soc$fdr<0.05])
+
+SOC_D_CA<-as.character(ARENY1618_CA_D.clr.RES$Protest.soc$OTU[ARENY1618_CA_D.clr.RES$Protest.soc$fdr<0.05])
+SOC_M_CA<-as.character(ARENY1618_CA_M.clr.RES$Protest.soc$OTU[ARENY1618_CA_M.clr.RES$Protest.soc$fdr<0.05])
+
+SOC_D_IL<-as.character(ARENY1618_IL_D.clr.RES$Protest.soc$OTU[ARENY1618_IL_D.clr.RES$Protest.soc$fdr<0.05])
+SOC_D_IL<-as.character(ARENY1618_IL_M.clr.RES$Protest.soc$OTU[ARENY1618_IL_M.clr.RES$Protest.soc$fdr<0.05])
+
+GEN_D_CO<-as.character(ARENY1618_CO_D.clr.RES$Protest.gen$OTU[ARENY1618_CO_D.clr.RES$Protest.gen$fdr<0.05])
+GEN_M_CO<-as.character(ARENY1618_CO_M.clr.RES$Protest.gen$OTU[ARENY1618_CO_M.clr.RES$Protest.gen$fdr<0.05])
+
+GEN_D_CA<-as.character(ARENY1618_CA_D.clr.RES$Protest.gen$OTU[ARENY1618_CA_D.clr.RES$Protest.gen$fdr<0.05])
+GEN_M_CA<-as.character(ARENY1618_CA_M.clr.RES$Protest.gen$OTU[ARENY1618_CA_M.clr.RES$Protest.gen$fdr<0.05])
+
+GEN_D_IL<-as.character(ARENY1618_IL_D.clr.RES$Protest.gen$OTU[ARENY1618_IL_D.clr.RES$Protest.gen$fdr<0.05])
+GEN_D_IL<-as.character(ARENY1618_IL_M.clr.RES$Protest.gen$OTU[ARENY1618_IL_M.clr.RES$Protest.gen$fdr<0.05])
+
+UNIQ.sig<-unique(c(SOC_D_CA,SOC_M_CA,
+       SOC_D_CO,SOC_M_CO,
+       SOC_D_IL,SOC_D_IL,
+       GEN_D_CA,GEN_M_CA,
+       GEN_D_CO,GEN_M_CO,
+       GEN_D_IL,GEN_D_IL))
+
+
+
+
+DF<-ARENY1618_CO_D.clr.RES$Protest.soc[,c(1,2)]
+names(DF)[2]<-"CO_D_SOC"
+DF.j<-DF
+
+DF<-ARENY1618_CO_M.clr.RES$Protest.soc[,c(1,2)]
+names(DF)[2]<-"CO_M_SOC"
+DF.j<-join(DF.j,DF,type="full")
+
+DF<-ARENY1618_CA_D.clr.RES$Protest.soc[,c(1,2)]
+names(DF)[2]<-"CA_D_SOC"
+DF.j<-join(DF.j,DF,type="full")
+
+DF<-ARENY1618_CA_M.clr.RES$Protest.soc[,c(1,2)]
+names(DF)[2]<-"CA_M_SOC"
+DF.j<-join(DF.j,DF,type="full")
+
+DF<-ARENY1618_IL_D.clr.RES$Protest.soc[,c(1,3)]
+names(DF)[2]<-"IL_D_SOC"
+DF.j<-join(DF.j,DF,type="full")
+
+DF<-ARENY1618_IL_M.clr.RES$Protest.soc[,c(1,3)]
+names(DF)[2]<-"IL_M_SOC"
+DF.j<-join(DF.j,DF,type="full")
+
+
+##############
+
+DF<-ARENY1618_CO_D.clr.RES$Protest.gen[,c(1,2)]
+names(DF)[2]<-"CO_D_GEN"
+DF.j<-join(DF.j,DF,type="full")
+
+DF<-ARENY1618_CO_M.clr.RES$Protest.gen[,c(1,2)]
+names(DF)[2]<-"CO_M_GEN"
+DF.j<-join(DF.j,DF,type="full")
+
+DF<-ARENY1618_CA_D.clr.RES$Protest.gen[,c(1,2)]
+names(DF)[2]<-"CA_D_GEN"
+DF.j<-join(DF.j,DF,type="full")
+
+DF<-ARENY1618_CA_M.clr.RES$Protest.gen[,c(1,2)]
+names(DF)[2]<-"CA_M_GEN"
+DF.j<-join(DF.j,DF,type="full")
+
+DF<-ARENY1618_IL_D.clr.RES$Protest.gen[,c(1,2)]
+names(DF)[2]<-"IL_D_GEN"
+DF.j<-join(DF.j,DF,type="full")
+
+DF<-ARENY1618_IL_M.clr.RES$Protest.gen[,c(1,2)]
+names(DF)[2]<-"IL_M_GEN"
+DF.j<-join(DF.j,DF,type="full")
+
+DF.j.r<-DF.j
+
+DF.j.r.sig<-DF.j.r[DF.j.r$OTU%in%UNIQ.sig,]
+
+
+##################################
+#Update verze - z-scores SS#
+##################################
+DF.j.r[2:dim(DF.j.r)[2]]<-apply(DF.j.r[2:dim(DF.j.r)[2]],2,scale)
+DF.j.r.long<-melt(DF.j.r)
+DF.j.fdr.long<-melt(DF.j.fdr)
+names(DF.j.r.long)[3]<-"r"
+names(DF.j.fdr.long)[3]<-"fdr"
+
+DF.j.r.fdr.long<-DF.j.r.long
+DF.j.r.fdr.long$fdr<-DF.j.fdr.long$fdr
+DF.j.r.fdr.long.sig<-DF.j.r.fdr.long[DF.j.r.fdr.long$OTU%in%UNIQ.sig,]
+
+########
+TAX_DF<-data.frame(tax_table(ARENY1618))
+TAX_DF$OTU<-rownames(TAX_DF)
+
+
+DF.j.r.fdr.long.sig.tax<-join(DF.j.r.fdr.long.sig,TAX_DF)
+
+DF.j.r.fdr.long.sig.tax$TAX_H<-DF.j.r.fdr.long.sig.tax$Genus
+DF.j.r.fdr.long.sig.tax$TAX_H<-ifelse(!is.na(DF.j.r.fdr.long.sig.tax$TAX_H),
+                                      DF.j.r.fdr.long.sig.tax$TAX_H,
+                                      DF.j.r.fdr.long.sig.tax$Family)
+DF.j.r.fdr.long.sig.tax$TAX_H<-ifelse(!is.na(DF.j.r.fdr.long.sig.tax$TAX_H),
+                                      DF.j.r.fdr.long.sig.tax$TAX_H,
+                                      DF.j.r.fdr.long.sig.tax$Order)
+DF.j.r.fdr.long.sig.tax$TAX_H<-ifelse(!is.na(DF.j.r.fdr.long.sig.tax$TAX_H),
+                                      DF.j.r.fdr.long.sig.tax$TAX_H,
+                                      DF.j.r.fdr.long.sig.tax$Class)
+
+DF.j.r.fdr.long.sig.tax$NAME<-paste(DF.j.r.fdr.long.sig.tax$OTU,DF.j.r.fdr.long.sig.tax$TAX_H)
+DF.j.r.fdr.long.sig.tax$rsig<-ifelse(DF.j.r.fdr.long.sig.tax$fdr<0.05,"*","")
+DF.j.r.fdr.long.sig.tax$rsig[is.na(DF.j.r.fdr.long.sig.tax$rsig)]<-""
+
+DF.j.r.fdr.long.sig.tax$subspecies<-ifelse(regexpr("_D_",DF.j.r.fdr.long.sig.tax$variable)>0,"MMD","MMM")
+DF.j.r.fdr.long.sig.tax$type<-ifelse(regexpr("_SOC",DF.j.r.fdr.long.sig.tax$variable)>0,"Social","Genetic")
+DF.j.r.fdr.long.sig.tax$section<-ifelse(regexpr("CO_",DF.j.r.fdr.long.sig.tax$variable)>0,"Colon","")
+DF.j.r.fdr.long.sig.tax$section<-ifelse(regexpr("CA_",DF.j.r.fdr.long.sig.tax$variable)>0,"Caecum",DF.j.r.fdr.long.sig.tax$section)
+DF.j.r.fdr.long.sig.tax$section<-ifelse(regexpr("IL_",DF.j.r.fdr.long.sig.tax$variable)>0,"Ileum",DF.j.r.fdr.long.sig.tax$section)
+
+DF.j.r.fdr.long.sig.tax$Class.mod<-DF.j.r.fdr.long.sig.tax$Class
+DF.j.r.fdr.long.sig.tax$Class.mod[!DF.j.r.fdr.long.sig.tax$Class.mod%in%c("Campylobacteria","Bacilli","Clostridia","Bacteroidia" )]<-"others"
+
+DF.j.r.fdr.long.sig.tax$NAME<-gsub("_unass.","",DF.j.r.fdr.long.sig.tax$NAME)
+DF.j.r.fdr.long.sig.tax$NAME<-gsub("_group","",DF.j.r.fdr.long.sig.tax$NAME)
+DF.j.r.fdr.long.sig.tax$NAME<-gsub("OTU_","ASV.",DF.j.r.fdr.long.sig.tax$NAME)
+
+
+#####categorial colors################
+
+DF.j.r.fdr.long.sig.tax2<-DF.j.r.fdr.long.sig.tax
+DF.j.r.fdr.long.sig.tax2$r[is.na(DF.j.r.fdr.long.sig.tax2$r)]<-"gray"
+DF.j.r.fdr.long.sig.tax2$r[DF.j.r.fdr.long.sig.tax2$rsig=="*"]<-"#D95F02"
+DF.j.r.fdr.long.sig.tax2$r[!DF.j.r.fdr.long.sig.tax2$r%in%c("#D95F02","gray")]<-"white"
+
+#rename Arthomitus
+DF.j.r.fdr.long.sig.tax2$NAME<-gsub("ASV.2374 Candidatus_Arthromitus","ASV.2374 Candidatus Savagella",DF.j.r.fdr.long.sig.tax2$NAME)
+
+
+#
+ASV<-sapply(strsplit(DF.j.r.fdr.long.sig.tax2$NAME, " "), function(x) x[1], simplify=TRUE)
+TAX<-gsub("ASV.[0-9]* ","",DF.j.r.fdr.long.sig.tax2$NAME)
+DF.j.r.fdr.long.sig.tax2$NAME<-paste(TAX,ASV)
+
+
+DF.j.r.fdr.long.sig.tax2$section<-as.factor(DF.j.r.fdr.long.sig.tax2$section)
+DF.j.r.fdr.long.sig.tax2$section<-factor(DF.j.r.fdr.long.sig.tax2$section, 
+                                         levels=c("Ileum","Caecum", "Colon"))
+
+Heat<-
+ggplot(DF.j.r.fdr.long.sig.tax2, aes(x = variable, y = NAME, fill = r)) +
+  geom_tile()+
+  #geom_text(aes(x = variable, y = NAME, label = rsig), color = "black", size = 3)+
+  facet_nested(Class.mod~type+section+subspecies,space = "free",scales = "free")+
+  theme_bw()+theme(panel.spacing = unit(0, "lines"))
+Heat<-Heat+scale_fill_manual(values = c("#D95F02","gray","white"))
+Heat.s<-small_fig(Heat)+theme(axis.text.x = element_blank(),
+                              axis.title = element_blank())
+
+
+Heat.s<-Heat.s+theme(axis.text.y = element_text(size=5))
+ggsave(Heat.s+theme(legend.position = "none"),
+         filename = "~/data/Areny_social/RESULTS_revision/ASV_heat_zscores_v2_REMANED.pdf",
+       width = 18, height = 28, units = "cm")
+Heat.s
+
+
+```
+
